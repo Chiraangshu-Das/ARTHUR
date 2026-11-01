@@ -1,0 +1,3 @@
+# Runtime dependencies for the depth-estimation adapter.
+torch>=2.5.1
+torchvision>=0.20.1

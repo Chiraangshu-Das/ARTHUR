@@ -1,0 +1,4 @@
+# Optional enhanced local face embeddings. This package is heavyweight and can install
+# TensorFlow/model dependencies. Install separately only if you want DeepFace+LBPH fusion.
+# LBPH-based local face recognition continues to work without this file.
+deepface>=0.0.93,<1.0.0

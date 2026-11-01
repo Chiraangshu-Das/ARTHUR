@@ -1,0 +1,22 @@
+# Standard speech, AI, desktop-control, gesture and client-server integrations.
+# Install into the project's Python 3.11 x64 virtual environment.
+openai-whisper>=20240930
+sounddevice>=0.5.0,<1.0.0
+google-genai>=1.0.0,<2.0.0
+google-api-python-client>=2.170.0,<3.0.0
+google-auth-httplib2>=0.2.0,<1.0.0
+google-auth-oauthlib>=1.2.0,<2.0.0
+mediapipe>=0.10.14,<1.0.0
+pyautogui>=0.9.54,<1.0.0
+pygetwindow>=0.0.9,<1.0.0
+screen-brightness-control>=0.24.0,<1.0.0
+pycaw>=20240210
+comtypes>=1.4.0,<2.0.0
+fastapi>=0.115.0,<1.0.0
+uvicorn[standard]>=0.30.0,<1.0.0
+pydantic>=2.8.0,<3.0.0
+sentence-transformers>=3.0.0,<6.0.0
+openwakeword>=0.6.0,<0.7.0
+pyperclip>=1.9.0,<2.0.0
+tzdata>=2024.1
+python-multipart>=0.0.9,<1.0.0

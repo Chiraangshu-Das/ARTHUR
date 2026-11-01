@@ -1,0 +1,14 @@
+
+# Indian Sign Language - Swin3D inference and evaluation
+# Recommended environment: Python 3.11 x64
+
+numpy>=1.26,<2.3
+opencv-contrib-python>=4.10,<5.0
+Pillow>=10.0,<14.0
+
+# Deep learning
+torch>=2.9,<3.0
+torchvision>=0.24,<1.0
+
+# Dataset evaluation and metrics
+scikit-learn>=1.4,<2.0
