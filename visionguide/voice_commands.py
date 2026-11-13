@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import os
 import threading
 
 _MODEL = None
@@ -52,7 +52,13 @@ def record_and_transcribe(
             _MODEL = whisper.load_model(model_name)
             _MODEL_NAME = model_name
         model = _MODEL
-    result = model.transcribe(mono_audio, fp16=False, verbose=False)
+    language = os.getenv("VISIONGUIDE_SPEECH_LANGUAGE", "en").strip().lower()
+    result = model.transcribe(
+        mono_audio,
+        language=None if language == "auto" else language,
+        fp16=False,
+        verbose=False,
+    )
     return str(result.get("text", "")).strip()
 
 
@@ -70,5 +76,11 @@ def transcribe_audio_file(file_path: str, model_name: str = "base") -> str:
             _MODEL = whisper.load_model(model_name)
             _MODEL_NAME = model_name
         model = _MODEL
-    result = model.transcribe(str(file_path), fp16=False, verbose=False)
+    language = os.getenv("VISIONGUIDE_SPEECH_LANGUAGE", "en").strip().lower()
+    result = model.transcribe(
+        str(file_path),
+        language=None if language == "auto" else language,
+        fp16=False,
+        verbose=False,
+    )
     return str(result.get("text", "")).strip()

@@ -8,13 +8,13 @@ import threading
 import time
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
-from visionguide.cloud_ai import GeminiAssistant
+from visionguide.cloud_ai import GroqAssistant
 from visionguide.desktop_actions import open_app, open_website, search_web, search_youtube
 from visionguide.integrations.google_workspace import (
     GOOGLE_WORKSPACE_WRITE_OPERATIONS, calendar_create_event, calendar_search, calendar_upcoming,
@@ -35,14 +35,14 @@ from visionguide.voice_commands import transcribe_audio_file
 load_dotenv()
 
 app = FastAPI(title="Arthur Device Agent API", version="1.0.0")
-gemini = GeminiAssistant()
+gemini = GroqAssistant()
 router = SemanticCommandRouter(gemini)
 _loop: asyncio.AbstractEventLoop | None = None
 _websocket_clients: set[WebSocket] = set()
 _pending_confirmations: dict[str, tuple[float, str, RoutedCommand]] = {}
 _confirmation_lock = threading.Lock()
 _CONFIRMATION_ACTIONS = {"wifi_set", "calendar_create_event", "gmail_compose", "gmail_send_current",
-                         "word_write", "whatsapp_compose", "whatsapp_send_current", "type_into_window", "general_query"}
+                         "word_write", "whatsapp_compose", "whatsapp_send_current", "type_into_window", "close_website"}
 _maps_services = GoogleMapsServices()
 
 
@@ -50,7 +50,13 @@ def _needs_confirmation(route: RoutedCommand) -> bool:
     if route.action in _CONFIRMATION_ACTIONS:
         return True
     return route.action == "google_workspace_feature" and str(route.arguments.get("operation", "")).casefold() in GOOGLE_WORKSPACE_WRITE_OPERATIONS
-_timers = TimerManager(lambda timer_id, label: _publish_event({"type": "timer_expired", "timer_id": timer_id, "label": label}))
+_timers = TimerManager(
+    lambda timer_id, label, kind: _publish_event({
+        "type": "reminder_due" if kind == "reminder" else "timer_expired",
+        "timer_id": timer_id, "label": label, "kind": kind,
+    }),
+    channel="api",
+)
 
 
 class CommandRequest(BaseModel):
@@ -67,6 +73,13 @@ class ConfirmCommandRequest(BaseModel):
 class TimerRequest(BaseModel):
     seconds: int = Field(ge=1, le=604800)
     label: str = Field(default="Reminder", max_length=100)
+
+
+class ReminderRequest(BaseModel):
+    due_at: str = Field(min_length=10, max_length=80)
+    label: str = Field(default="Reminder", max_length=100)
+    timezone_name: str = Field(default="Asia/Kolkata", min_length=1, max_length=80)
+    recurrence: Literal["none", "daily", "weekly"] = "none"
 
 
 class GmailDraftRequest(BaseModel):
@@ -142,7 +155,7 @@ def health(_: bool = Depends(_authorized_header)) -> dict[str, Any]:
 async def transcribe_audio(
     audio: UploadFile = File(...), model: str = "base", _: bool = Depends(_authorized_header)
 ) -> dict[str, Any]:
-    """Transcribe a user-submitted audio clip locally with Whisper; never forwards the audio to Gemini."""
+    """Transcribe a user-submitted audio clip locally with Whisper; never forwards the audio to Groq."""
     allowed_suffixes = {".wav", ".mp3", ".m4a", ".webm", ".ogg", ".flac", ".mp4", ".mpeg", ".mpga"}
     suffix = Path(audio.filename or "voice.wav").suffix.lower() or ".wav"
     if suffix not in allowed_suffixes:
@@ -160,7 +173,7 @@ async def transcribe_audio(
             handle.write(content)
             temp_path = handle.name
         transcript = await asyncio.to_thread(transcribe_audio_file, temp_path, model)
-        return {"transcript": transcript, "model": model, "processing": "local-whisper", "audio_forwarded_to_gemini": False}
+        return {"transcript": transcript, "model": model, "processing": "local-whisper", "audio_forwarded_to_groq": False}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Whisper transcription failed: {exc}") from exc
     finally:
@@ -192,6 +205,9 @@ def tools(_: bool = Depends(_authorized_header)) -> dict[str, Any]:
         {"name": "timer_set", "background": True},
         {"name": "timer_list", "background": True},
         {"name": "timer_cancel", "background": True},
+        {"name": "reminder_schedule", "background": True, "persistent": True},
+        {"name": "reminder_list", "background": True, "persistent": True},
+        {"name": "reminder_cancel", "background": True, "persistent": True},
         {"name": "gmail_unread", "oauth": True},
         {"name": "gmail_search", "oauth": True},
         {"name": "gmail_read_message", "oauth": True},
@@ -208,7 +224,7 @@ def tools(_: bool = Depends(_authorized_header)) -> dict[str, Any]:
         {"name": "whatsapp_compose", "window_automation": True, "review_required": True},
         {"name": "whatsapp_send_current", "window_automation": True, "requires_confirmation": True},
         {"name": "type_into_window", "window_automation": True, "review_required": True},
-        {"name": "general_query", "text_provider": "Gemini", "requires_confirmation": True},
+        {"name": "general_query", "text_provider": "Groq", "requires_confirmation": False},
     ]}
 
 
@@ -222,7 +238,7 @@ def command(request: CommandRequest, _: bool = Depends(_authorized_header)) -> d
     if _needs_confirmation(routed):
         confirmation_id = _create_confirmation(request.device_id, routed)
         preview: dict[str, Any] = {}
-        for key in ("recipient", "subject", "instructions", "summary", "start", "end", "timezone_name", "location", "text", "contact", "message", "target", "prompt", "enabled", "adapter", "name", "operation", "query", "identifier", "title", "content", "range_name", "values_json", "course_id", "due", "target_language", "source_language", "language", "days", "limit"):
+        for key in ("recipient", "subject", "instructions", "summary", "start", "end", "timezone_name", "location", "text", "contact", "message", "target", "prompt", "enabled","adapter", "name", "operation", "query", "identifier", "title", "content", "range_name", "values_json", "course_id", "due", "target_language", "source_language", "language", "days", "limit"):
             if key in routed.arguments:
                 value = routed.arguments[key]
                 preview[key] = str(value)[:1500] if isinstance(value, str) else value
@@ -268,6 +284,38 @@ def get_timers(_: bool = Depends(_authorized_header)) -> dict[str, Any]:
 @app.delete("/api/v1/timers/{timer_id}")
 def delete_timer(timer_id: int, _: bool = Depends(_authorized_header)) -> dict[str, Any]:
     return {"id": timer_id, "cancelled": _timers.cancel(timer_id)}
+
+
+@app.post("/api/v1/reminders")
+def create_reminder(request: ReminderRequest, _: bool = Depends(_authorized_header)) -> dict[str, Any]:
+    try:
+        record = _timers.schedule_at(
+            request.due_at,
+            request.label,
+            timezone_name=request.timezone_name,
+            recurrence=request.recurrence,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    reminder = next(
+        item for item in _timers.list_schedules(include_completed=True)
+        if item["id"] == record.timer_id
+    )
+    return {"status": "ok", "reminder": reminder}
+
+
+@app.get("/api/v1/reminders")
+def get_reminders(_: bool = Depends(_authorized_header)) -> dict[str, Any]:
+    reminders = [
+        item for item in _timers.list_schedules()
+        if item["kind"] == "reminder"
+    ]
+    return {"reminders": reminders}
+
+
+@app.delete("/api/v1/reminders/{reminder_id}")
+def delete_reminder(reminder_id: int, _: bool = Depends(_authorized_header)) -> dict[str, Any]:
+    return {"id": reminder_id, "cancelled": _timers.cancel(reminder_id)}
 
 
 @app.post("/api/v1/workspace/gmail/drafts")
@@ -455,6 +503,21 @@ def execute_route(route: RoutedCommand, *, confirmed: bool = False) -> dict[str,
         if action == "timer_cancel":
             cancelled = _timers.cancel(int(args.get("id", 0)))
             return {"status": "ok" if cancelled else "not_found", "cancelled": cancelled}
+        if action == "reminder_schedule":
+            record = _timers.schedule_at(
+                str(args.get("due_at", "")),
+                str(args.get("label", "Reminder")),
+                timezone_name=str(args.get("timezone_name", "Asia/Kolkata")),
+                recurrence=str(args.get("recurrence", "none")),
+            )
+            reminder = next(item for item in _timers.list_schedules(include_completed=True) if item["id"] == record.timer_id)
+            return {"status": "ok", "reminder": reminder}
+        if action == "reminder_list":
+            reminders = [item for item in _timers.list_schedules() if item["kind"] == "reminder"]
+            return {"status": "ok", "reminders": reminders}
+        if action == "reminder_cancel":
+            cancelled = _timers.cancel(int(args.get("id", 0)))
+            return {"status": "ok" if cancelled else "not_found", "cancelled": cancelled}
         if action == "gmail_unread":
             include_body = bool(args.get("include_body", False))
             messages = gmail_unread(int(args.get("limit", 10)), include_body=include_body)
@@ -485,7 +548,7 @@ def execute_route(route: RoutedCommand, *, confirmed: bool = False) -> dict[str,
             )}
         if action == "gmail_compose":
             if not confirmed:
-                return {"status": "confirmation_required", "message": "This will send the drafting instructions to Gemini and enter a draft into the local Gmail window. It will not send the email.", "preview": {"recipient": args.get("recipient", ""), "subject": args.get("subject", ""), "instructions": args.get("instructions", "")}}
+                return {"status": "confirmation_required", "message": "This will send the drafting instructions to Groq and enter a draft into the local Gmail window. It will not send the email.", "preview": {"recipient": args.get("recipient", ""), "subject": args.get("subject", ""), "instructions": args.get("instructions", "")}}
             recipient = str(args.get("recipient", ""))
             subject = str(args.get("subject", ""))
             instructions = str(args.get("instructions", ""))
@@ -509,9 +572,14 @@ def execute_route(route: RoutedCommand, *, confirmed: bool = False) -> dict[str,
             return {"status": "send_shortcut_issued", "message": send_current_whatsapp(confirmed_send=True)}
         if action == "type_into_window":
             if not confirmed:
-                return {"status": "confirmation_required", "message": "This pastes text into a target app window without submitting it.", "preview": {"target": args.get("target", ""), "text": str(args.get("text", ""))[:1000]}}
+                return {"status": "confirmation_required", "message": "This pastes text into a target app window without submitting it.", "preview": {"target": args.get("target", ""), "element": args.get("element", ""), "text": str(args.get("text", ""))[:1000]}}
             from visionguide.integrations.gui_automation import type_into_window
-            return {"status": "ok", "message": type_into_window(str(args.get("target", "")), str(args.get("text", "")))}
+            return {"status": "ok", "message": type_into_window(str(args.get("target", "")), str(args.get("text", "")), str(args.get("element", "")))}
+        if action == "close_website":
+            if not confirmed:
+                return {"status": "confirmation_required", "message": "This closes the matching active browser tab, not the entire browser.", "preview": {"website": args.get("name", "")}}
+            from visionguide.integrations.gui_automation import close_website_tab
+            return {"status": "ok", "message": close_website_tab(str(args.get("name", "")))}
         if action == "gmail_send_current":
             if not confirmed:
                 return {"status": "confirmation_required", "message": "Review the current Gmail draft and explicitly confirm sending via Ctrl+Enter."}

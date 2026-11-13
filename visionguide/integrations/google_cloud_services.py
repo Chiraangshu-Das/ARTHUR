@@ -1,7 +1,7 @@
 """On-demand clients for Google Cloud Translation and Natural Language APIs.
 
-These APIs use dedicated least-privilege OAuth scope profiles, separate from Gemini's
-API key and the Maps Platform key. Text is not cached or persisted locally.
+These APIs use dedicated least-privilege Google OAuth scope profiles, separate from
+Groq inference and the Maps Platform key. Text is not cached or persisted locally.
 """
 from __future__ import annotations
 

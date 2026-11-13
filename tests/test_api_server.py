@@ -1,3 +1,4 @@
+import os
 import unittest
 from unittest.mock import patch
 from fastapi.testclient import TestClient
@@ -7,9 +8,13 @@ from visionguide.api_server import app
 class DeviceApiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.client = TestClient(app)
+        token = os.getenv("VISIONGUIDE_API_TOKEN", "").strip()
+        headers = (
+            {"Authorization": f"Bearer {token}"}
+            if token else {}
+        )
+        cls.client = TestClient(app, headers=headers)
         cls.client.__enter__()
-
     @classmethod
     def tearDownClass(cls):
         cls.client.__exit__(None, None, None)
@@ -90,6 +95,27 @@ class DeviceApiTests(unittest.TestCase):
         timer_id = response.json()['id']
         cancelled = self.client.delete(f'/api/v1/timers/{timer_id}')
         self.assertTrue(cancelled.json()['cancelled'])
+
+    def test_plain_text_groq_fallback_does_not_require_confirmation(self):
+        from visionguide import api_server
+        from visionguide.semantic_router import RoutedCommand
+
+        routed = RoutedCommand("general_query", {"prompt": "Explain recursion"}, "unmatched-to-groq", 0.0)
+        with patch.object(api_server.router, "route", return_value=routed), \
+             patch.object(api_server.gemini, "ask_text", return_value="Recursion is when a function calls itself.") as ask:
+            response = self.client.post("/api/v1/command", json={
+                "text": "Explain recursion", "device_id": "text-client",
+            })
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["result"]["status"], "ok")
+        self.assertEqual(payload["result"]["answer"], "Recursion is when a function calls itself.")
+        ask.assert_called_once_with("Explain recursion")
+
+        tools = self.client.get("/api/v1/tools").json()["tools"]
+        general = next(item for item in tools if item["name"] == "general_query")
+        self.assertFalse(general["requires_confirmation"])
 
 
 if __name__ == '__main__':

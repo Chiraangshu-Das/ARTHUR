@@ -33,7 +33,7 @@ EXTENDED_WRITE_OPERATIONS = frozenset({
     "gmail_sendas_update", "gmail_sendas_delete", "gmail_delegate_create", "gmail_delegate_delete",
     "gmail_notifications_watch", "gmail_notifications_stop", "gmail_setting_update", "gmail_send_to_self", "gmail_compose_send", "gmail_compose_draft_create", "drive_file_create", "drive_file_update", "drive_file_delete", "drive_file_copy",
     "drive_permission_create", "drive_permission_update", "drive_permission_delete", "drive_script_create",
-    "drive_script_update", "drive_appdata_create", "drive_appdata_delete", "drive_item_update", "drive_item_delete", "drive_metadata_update", "docs_replace_text", "docs_insert_text", "docs_batch_update", "sheets_create",
+    "drive_script_update", "drive_appdata_create", "drive_appdata_delete", "drive_item_update", "drive_item_delete", "drive_metadata_update", "docs_replace_text", "docs_insert_text", "docs_batch_update", "docs_delete_range", "sheets_create",
     "sheets_append", "sheets_clear", "sheets_batch_update", "slides_batch_update", "tasks_update",
     "tasks_delete", "tasks_complete", "tasks_reopen", "people_contact_create", "people_contact_update",
     "people_contact_delete", "classroom_course_create", "classroom_course_update", "classroom_course_delete",
@@ -495,9 +495,24 @@ def _drive(operation: str, a: dict[str, Any], confirmed: bool) -> dict[str, Any]
         fid = _id(a.get("identifier"), "Drive file ID")
         if operation == "drive_file_update":
             body = _json_object(a.get("payload_json"))
-            if not body:
-                raise ValueError("Provide payload_json with Drive file metadata to update.")
-            return {"file": service.files().update(fileId=fid, body=body, fields="id,name,mimeType,modifiedTime,webViewLink,trashed").execute()}
+            update_kwargs: dict[str, Any] = {
+                "fileId": fid,
+                "body": body,
+                "fields": "id,name,mimeType,modifiedTime,webViewLink,trashed",
+            }
+            if "content" in a and a.get("content") is not None:
+                content = str(a.get("content", ""))
+                if len(content) > 1_000_000:
+                    raise ValueError("Drive file content must be 1,000,000 characters or fewer.")
+                mime_type = str(body.pop("mimeType", a.get("mime_type", "text/plain")) or "text/plain")
+                import io
+                from googleapiclient.http import MediaIoBaseUpload
+                update_kwargs["media_body"] = MediaIoBaseUpload(
+                    io.BytesIO(content.encode("utf-8")), mimetype=mime_type, resumable=False
+                )
+            elif not body:
+                raise ValueError("Provide payload_json for metadata changes or content for a file-content update.")
+            return {"file": service.files().update(**update_kwargs).execute()}
         if operation == "drive_file_copy":
             body = _json_object(a.get("payload_json")) or {"name": _text(a.get("title"), "copy name", 250, True)}
             return {"file": service.files().copy(fileId=fid, body=body, fields="id,name,mimeType,webViewLink").execute()}
@@ -631,6 +646,16 @@ def _documents(operation: str, a: dict[str, Any], confirmed: bool) -> dict[str, 
         if not isinstance(requests, list) or not requests or len(requests) > 100 or any(not isinstance(r, dict) or len(r) != 1 or next(iter(r)) not in allowed for r in requests):
             raise ValueError("Docs requests must be 1–100 objects using the documented allowlisted edit request types.")
         return {"result": _svc("docs", "v1", "docs_write").documents().batchUpdate(documentId=did, body={"requests": requests}).execute()}
+    if operation == "docs_delete_range":
+        _require_confirmed(confirmed, "Deleting a content range from a Google Doc")
+        did = _id(a.get("identifier"), "Google Docs document ID")
+        start_index = int(a.get("start_index", 0) or 0)
+        end_index = int(a.get("end_index", 0) or 0)
+        if start_index < 1 or end_index <= start_index or end_index > 2_000_000:
+            raise ValueError("Provide a valid Google Docs content range: start_index >= 1 and end_index > start_index.")
+        body = {"requests": [{"deleteContentRange": {"range": {"startIndex": start_index, "endIndex": end_index}}}]}
+        result = _svc("docs", "v1", "docs_write").documents().batchUpdate(documentId=did, body=body).execute()
+        return {"document_id": did, "deleted_range": {"start_index": start_index, "end_index": end_index}, "result": result}
     raise ValueError(f"Unsupported Docs operation: {operation}")
 
 
@@ -1174,8 +1199,8 @@ def _generative(operation: str, a: dict[str, Any], confirmed: bool) -> dict[str,
         return _oauth_rest("generative_retriever_read", "POST", f"{base}/{name}:query", body=body)
     if operation == "generative_peruserquota_status":
         # This scope authorizes account-based quota usage but does not itself expose a
-        # standalone quota REST endpoint. The product-facing generation path remains Gemini API-key based.
-        return {"kind": operation, "available": False, "reason": "The scope is consent metadata for per-user quota access, not a standalone quota query endpoint; existing Gemini generation uses GEMINI_API_KEY."}
+        # standalone quota REST endpoint. Arthur's primary assistant generation is handled separately by the Groq provider.
+        return {"kind": operation, "available": False, "reason": "The scope is consent metadata for per-user quota access, not a standalone quota query endpoint. Arthur's primary text, tool-routing, and vision generation uses GROQ_API_KEY."}
     raise ValueError(f"Unsupported Generative Language operation: {operation}")
 
 
@@ -1184,7 +1209,7 @@ _OPERATION_GROUPS = {
     "calendar": {"calendar_list", "calendar_create", "calendar_app_created_calendar_create", "calendar_get", "calendar_update", "calendar_delete", "calendar_subscribe", "calendar_unsubscribe", "calendar_events_list", "calendar_readonly_events", "calendar_public_events", "calendar_event_get", "calendar_event_create", "calendar_event_update", "calendar_event_delete", "calendar_owned_events_list", "calendar_owned_event_get", "calendar_owned_event_create", "calendar_owned_event_update", "calendar_owned_event_delete", "calendar_app_created_events_list", "calendar_app_created_event_get", "calendar_app_created_event_create", "calendar_app_created_event_update", "calendar_app_created_event_delete", "calendar_freebusy", "calendar_events_freebusy", "calendar_settings_list", "calendar_setting_get", "calendar_acl_list", "calendar_acl_create", "calendar_acl_update", "calendar_acl_delete"},
     "gmail": {"gmail_messages_list", "gmail_metadata_list", "gmail_message_read", "gmail_message_modify", "gmail_message_delete", "gmail_message_insert", "gmail_send", "gmail_drafts_list", "gmail_draft_read", "gmail_draft_create", "gmail_draft_update", "gmail_draft_delete", "gmail_draft_send", "gmail_labels_list", "gmail_label_create", "gmail_label_update", "gmail_label_delete", "gmail_filters_list", "gmail_filter_create", "gmail_filter_delete", "gmail_settings_list", "gmail_setting_get", "gmail_forwarding_list", "gmail_forwarding_create", "gmail_forwarding_delete", "gmail_autoforward_get", "gmail_autoforward_update", "gmail_sendas_list", "gmail_sendas_create", "gmail_sendas_update", "gmail_sendas_delete", "gmail_delegates_list", "gmail_delegate_create", "gmail_delegate_delete", "gmail_notifications_watch", "gmail_notifications_stop", "gmail_setting_update", "gmail_user_metadata", "gmail_send_to_self", "gmail_compose_send", "gmail_compose_draft_create"},
     "drive": {"drive_files_list", "drive_meet_files_list", "drive_appdata_list", "drive_appdata_create", "drive_appdata_delete", "drive_apps_list", "drive_file_get", "drive_file_create", "drive_file_update", "drive_file_copy", "drive_file_delete", "drive_permission_list", "drive_permission_create", "drive_permission_update", "drive_permission_delete", "drive_activity_list", "drive_script_get", "drive_script_create", "drive_script_update", "drive_about", "drive_photo_files_list", "drive_item_list", "drive_item_get", "drive_collaboration_item_list", "drive_collaboration_item_get", "drive_item_update", "drive_item_delete", "drive_metadata_update"},
-    "docs": {"docs_replace_text", "docs_insert_text", "docs_batch_update"},
+    "docs": {"docs_replace_text", "docs_insert_text", "docs_batch_update", "docs_delete_range"},
     "sheets": {"sheets_create", "sheets_append", "sheets_clear", "sheets_batch_update"},
     "slides": {"slides_batch_update"},
     "tasks": {"tasks_list", "tasks_create", "tasks_update", "tasks_delete", "tasks_complete", "tasks_reopen"},

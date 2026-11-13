@@ -21,14 +21,14 @@ A component being listed here does not necessarily mean that it is bundled with 
 | Pycaw and comtypes | Windows Core Audio volume/mute control | <https://github.com/AndreMiras/pycaw> and <https://github.com/enthought/comtypes> |
 | pyperclip | Clipboard paste for multilingual GUI text | <https://pypi.org/project/pyperclip/> |
 | FastAPI / Uvicorn | REST/WebSocket service layer | <https://fastapi.tiangolo.com/> |
-| Google Gen AI Python SDK | Gemini function calling, text and visual Q&A | <https://github.com/googleapis/python-genai> |
+| Groq Python SDK | Groq text, tool calling and vision API access | <https://github.com/groq/groq-python> |
 | SentenceTransformers / all-MiniLM-L6-v2 | Local semantic similarity fallback; model-card licensing applies separately | <https://www.sbert.net/> and <https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2> |
 | Pydantic | API request schema validation | <https://docs.pydantic.dev/> |
 | Python multipart parser | FastAPI multipart audio uploads | <https://github.com/Kludex/python-multipart> |
 | Flutter `http`, `web_socket_channel`, `speech_to_text`, `record`, `path_provider` | Mobile API, notification, speech capture and temporary audio file flows | <https://pub.dev/>; review each pinned package's current licence and platform permission requirements |
 | Google API Python client and OAuth libraries | Gmail and Calendar account integrations | <https://github.com/googleapis/google-api-python-client> |
 | openWakeWord | Local wake-word runtime; model files have independent terms | <https://github.com/dscripka/openWakeWord> |
-| Google Gemini API | Hosted function calling, text response and visual Q&A | Provider API terms, privacy and quotas apply: <https://ai.google.dev/gemini-api/terms> |
+| Groq API | Hosted function calling, text response and visual Q&A | Provider API terms, privacy and quotas apply: <https://groq.com/> |
 
 ## Indian Sign Language (ISL) recognition
 
@@ -83,7 +83,7 @@ No trained continuous-ISL sentence checkpoint or custom wake-word ONNX file is b
 
 - Review the exact licence for every pinned package version and downloaded model checkpoint.
 - Some packages and models may impose obligations beyond those of the Python package that loads them.
-- Hosted services such as Gemini and Google APIs are governed by provider terms, privacy policies, quotas and billing conditions.
+- Hosted services such as Groq and Google APIs are governed by provider terms, privacy policies, quotas and billing conditions.
 - Dataset licences may require attribution, impose restrictions on redistribution or require additional consent for derived model weights.
 - Do not assume that a publicly accessible repository or model download automatically permits commercial use or redistribution.
 - Keep third-party notices, licence texts and required attribution with redistributed builds where applicable.

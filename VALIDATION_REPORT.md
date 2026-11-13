@@ -1,14 +1,21 @@
 # Arthur Validation Report
 
-**Validation date:** 2026-10-28  
+**Validation date:** 2026-11-13  
 **Project location:** `Arthur`  
 **Environment:** Linux build/test container; Python 3.13 runtime for this verification pass. The project runtime baseline remains Python 3.11 x64 on Windows for the reference desktop application.
+
+
+## Direct Groq fallback and confirmed document CRUD follow-up (2026-11-13)
+
+The latest overlay validation completed with **167 passed, 4 warnings** after adding tests for direct text-only Groq fallback (desktop and authenticated API), Microsoft Word save/save-as, find-and-replace, selection deletion, Google Docs content-range deletion and Google Drive file-content update. The direct fallback sends the current text request without a second consent dialog; conversation context remains opt-in. State-changing operations retain their confirmation gates.
+
+The test environment is the Linux build container using Python 3.13. The Windows Word COM automation, live Google OAuth/API operations, browser UI and real Groq service still require testing on the target Windows laptop.
 
 ## Automated checks performed
 
 | Check | Result |
 |---|---|
-| `python -m pytest -q` | **97 passed, 4 warnings** (existing FastAPI `@app.on_event` deprecation warnings) |
+| `python -m pytest -q` | **149 passed, 4 warnings** (existing FastAPI `@app.on_event` deprecation warnings) |
 | `python -m py_compile main.py visionguide/*.py visionguide/integrations/*.py` | Passed |
 | `python -m compileall -q main.py visionguide tools tests clients/python` | Passed |
 | `python main.py --help` | Passed |
@@ -22,11 +29,11 @@ External providers are mocked in automated tests; they do not prove access to th
 
 ## Important code paths in this release
 
-- Gemini function-call routing with automatic tool execution disabled, deterministic command patterns, typed action registry and local safety validation.
+- Groq function-call routing with automatic tool execution disabled, deterministic command patterns, typed action registry and local safety validation.
 - Literal typing versus safe arithmetic; Calculator launch/type workflow with an explicit caveat that its displayed result is not visually verified.
 - One system-wide air virtual keyboard, mouse input, camera gesture pointer/pinch-click, vertical scroll and browser-tab swipes; keyboard and gestures are explicit opt-in.
 - Consent-based local LBPH face profiles with optional DeepFace embedding fusion; conflicting matches resolve to unknown; per-profile preferences persist locally.
-- Product research using OCR, Google Cloud Vision Web Detection and Gemini where configured, after explicit confirmation before camera image upload. Similar images/pages are leads, not identity verification.
+- Product research using OCR, Google Cloud Vision Web Detection and Groq where configured, after explicit confirmation before camera image upload. Similar images/pages are leads, not identity verification.
 - Capped/cached Google Geocoding, Weather and Routes calls plus Cloud Vision Web Detection; caps are local per-install safeguards and do not protect against other apps or project-wide costs.
 - Best-effort Windows live-location route guidance with spoken maneuvers and off-route rerouting, subject to live provider/location availability.
 - Bounded local action/result history for follow-up requests.
@@ -76,7 +83,7 @@ These checks verify dependency availability and import compatibility, not comple
 - Actual Windows GUI focus/paste, non-activating keyboard overlay behaviour, mouse injection, display/audio/network controls, camera gesture operation, webcam calibration and browser tab switching.
 - Live location permission and GPS accuracy, real navigation, off-route rerouting and maneuver timing on the target Windows device.
 - Actual Google API requests against the user's project, API enablement, key restrictions, billing status, and current account-level quotas/pricing. Tests use mocks; Google free allowances and pricing can change.
-- Real Gemini/Cloud Vision image search with a user-approved image; live product pages/manual accuracy.
+- Real Groq/Cloud Vision image search with a user-approved image; live product pages/manual accuracy.
 - Actual recognition metrics with consenting users on the target laptop; DeepFace is an optional heavy dependency and requires first-run model weights.
 - Live Google OAuth and Workspace API calls, actual mobile build generation, and continuous sentence-level ISL translation. The current test container does not authenticate to a Google account and does not establish that all external APIs/scopes are enabled or approved.
 - End-to-end live-camera Swin3D ISL recognition through Arthur's camera activation, recognition and spoken-output workflow.

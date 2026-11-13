@@ -50,7 +50,11 @@ def _perspective_correct(image):
 
 
 def read_document(image, tesseract_cmd: str | None = None) -> str:
-    """Local OCR with contrast normalization and page perspective correction when enabled."""
+    """Run local OCR against several page-friendly variants and keep the best-confidence result.
+
+    OCR remains fully local. The multi-pass path is intended for ordinary printed pages;
+    it cannot recover detail that was never captured by a low-resolution or out-of-focus camera.
+    """
     try:
         import pytesseract
     except ImportError as exc:
@@ -61,16 +65,64 @@ def read_document(image, tesseract_cmd: str | None = None) -> str:
         pytesseract.pytesseract.tesseract_cmd = cmd
     if image is None or getattr(image, "size", 0) == 0:
         raise ValueError("There is no camera frame to scan yet.")
-    corrected = _perspective_correct(image) if len(image.shape) == 3 else image
-    gray = cv2.cvtColor(corrected, cv2.COLOR_BGR2GRAY) if len(corrected.shape) == 3 else corrected
-    if gray.shape[1] < 1200:
-        factor = min(2.0, 1200 / max(1, gray.shape[1]))
-        gray = cv2.resize(gray, None, fx=factor, fy=factor, interpolation=cv2.INTER_CUBIC)
-    gray = cv2.bilateralFilter(gray, 7, 45, 45)
-    threshold = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                      cv2.THRESH_BINARY, 31, 11)
+
+    corrected = _perspective_correct(image) if len(image.shape) == 3 else image.copy()
+    gray = cv2.cvtColor(corrected, cv2.COLOR_BGR2GRAY) if len(corrected.shape) == 3 else corrected.copy()
+    # Keep detail while bringing small print into a useful OCR range.
+    scale = min(2.5, 1800 / max(1, gray.shape[1])) if gray.shape[1] < 1800 else 1.0
+    if scale > 1.0:
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.fastNlMeansDenoising(gray, None, h=8, templateWindowSize=7, searchWindowSize=21)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+    adaptive = cv2.adaptiveThreshold(
+        clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 11
+    )
+    _threshold, otsu = cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    candidates = (("contrast", clahe, 6), ("adaptive", adaptive, 6), ("otsu", otsu, 11))
+    best_text = ""
+    best_score = float("-inf")
     try:
-        return pytesseract.image_to_string(threshold, config="--oem 3 --psm 6").strip()
+        output_dict = pytesseract.Output.DICT
+        for _name, variant, psm in candidates:
+            data = pytesseract.image_to_data(
+                variant,
+                config=f"--oem 3 --psm {psm}",
+                output_type=output_dict,
+            )
+            grouped: dict[tuple[int, int, int], list[str]] = {}
+            confidences: list[float] = []
+            words = data.get("text", [])
+            confs = data.get("conf", [])
+            blocks = data.get("block_num", [])
+            paragraphs = data.get("par_num", [])
+            lines = data.get("line_num", [])
+            for index, word in enumerate(words):
+                token = str(word).strip()
+                if not token:
+                    continue
+                try:
+                    confidence = float(confs[index])
+                except (ValueError, IndexError, TypeError):
+                    confidence = -1.0
+                if confidence >= 0:
+                    confidences.append(confidence)
+                if confidence >= 0 and index < len(blocks) and index < len(paragraphs) and index < len(lines):
+                    line_key = (int(blocks[index]), int(paragraphs[index]), int(lines[index]))
+                    grouped.setdefault(line_key, []).append(token)
+            text = "\n".join(" ".join(parts) for parts in grouped.values()).strip()
+            if text:
+                mean_confidence = sum(confidences) / max(1, len(confidences))
+                word_count = sum(len(line.split()) for line in text.splitlines())
+                line_count = len(text.splitlines())
+                score = mean_confidence + min(word_count, 40) * 0.20 + min(line_count, 12) * 0.35
+                if score > best_score:
+                    best_score, best_text = score, text
+
+        # Compatibility fallback for older Tesseract bindings or empty layout data.
+        if not best_text:
+            best_text = pytesseract.image_to_string(clahe, config="--oem 3 --psm 6").strip()
+        return best_text
     except pytesseract.pytesseract.TesseractNotFoundError as exc:
         raise RuntimeError(
             "Tesseract OCR engine is not installed or not on PATH. Install the Tesseract application; "

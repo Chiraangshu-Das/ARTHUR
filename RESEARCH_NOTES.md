@@ -79,7 +79,7 @@ These feature pages do **not** establish that any product offers a single, gener
 ## Specific engineering changes from research
 
 1. **User-commanded speech:** The app has no startup spoken greeting or continuous narration. Online image requests and microphone recording require separate user actions; image sharing requires confirmation.
-2. **Separate local and online reasoning:** Local YOLO summaries work without an API key; Gemini can describe visual details and answer general questions only after an explicit request. Text-only AI does not attach a camera image.
+2. **Separate local and online reasoning:** Local YOLO summaries work without an API key; Groq can describe visual details and answer general questions only after an explicit request. Text-only AI does not attach a camera image.
 3. **Depth separated from detection:** Depth is an opt-in model because it is large and can be slow. Calibration is stored separately and marked approximate.
 4. **Safety logic is cautious:** Depth alerts require several temporal samples, plausible closing motion, range limits and a cooldown. This is a heuristic and remains off by default; it is not a validated collision predictor.
 5. **Personal memory is local and explicit:** User notes are written to SQLite only when requested, searchable, and deletable. Face recognition is limited to consented local enrollment; no stranger face-search service is called.

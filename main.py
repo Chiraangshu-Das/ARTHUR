@@ -14,7 +14,7 @@ from visionguide.speech import SpeechOutput
 def main() -> None:
     parser = argparse.ArgumentParser(description="Arthur local-first assistive-ai client")
     parser.add_argument("--model", default="models/yolo26n.pt", help="Path to an Ultralytics-compatible .pt model")
-    parser.add_argument("--camera", default="0", help="Camera index such as 0/1, or a local HTTP/RTSP stream URL from a phone camera app")
+    parser.add_argument("--camera", default=None, help="Camera index such as 0/1, or a local HTTP/RTSP stream URL from a phone camera app; defaults to VISIONGUIDE_CAMERA_SOURCE in .env")
     parser.add_argument("--confidence", type=float, default=0.35, help="Detection confidence in the range 0.05–0.95")
     parser.add_argument("--fps", type=int, default=8, help="Maximum object-detection inference rate")
     parser.add_argument("--no-speech", action="store_true", help="Disable local text-to-speech")
@@ -41,12 +41,14 @@ def main() -> None:
         parser.error(f"Model file was not found: {model_path}")
 
     speech = SpeechOutput(enabled=not args.no_speech)
+    camera_arg = args.camera if args.camera is not None else os.getenv("VISIONGUIDE_CAMERA_SOURCE", "0")
+    camera_arg = str(camera_arg).strip()
     try:
-        camera_source = int(args.camera)
+        camera_source = int(camera_arg)
     except ValueError:
-        camera_source = args.camera.strip()
+        camera_source = camera_arg
         if not camera_source:
-            parser.error("--camera cannot be empty")
+            parser.error("--camera / VISIONGUIDE_CAMERA_SOURCE cannot be empty")
     worker = VisionWorker(
         model_path=str(model_path),
         camera_index=camera_source,

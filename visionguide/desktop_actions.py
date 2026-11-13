@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import platform
 import glob
+import json
 import re
 import shutil
 import subprocess
@@ -10,6 +11,9 @@ import webbrowser
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote_plus
+
+
+_LAST_YOUTUBE_SEARCH_QUERY: str | None = None
 
 
 WEBSITE_URLS = {
@@ -136,13 +140,98 @@ def open_website(name: str) -> str:
 
 
 def search_youtube(query: str) -> str:
+    """Open YouTube search results and retain the query for follow-up selection commands."""
+    global _LAST_YOUTUBE_SEARCH_QUERY
     query = str(query).strip()
     if not query:
         raise ValueError("A YouTube search query is required.")
     url = "https://www.youtube.com/results?search_query=" + quote_plus(query)
     if not webbrowser.open(url, new=2):
         raise RuntimeError("The default browser did not report that it opened YouTube search.")
+    _LAST_YOUTUBE_SEARCH_QUERY = query
     return f"Opened YouTube search results for {query}."
+
+
+def _youtube_video_results_from_html(html: str) -> list[dict[str, str]]:
+    """Extract ordered video results from YouTube's embedded ytInitialData JSON."""
+    decoder = json.JSONDecoder()
+    initial_data = None
+    for marker in re.finditer(r"ytInitialData\s*=\s*", str(html)):
+        try:
+            initial_data, _end = decoder.raw_decode(str(html)[marker.end():])
+            break
+        except json.JSONDecodeError:
+            continue
+    if initial_data is None:
+        raise RuntimeError("YouTube did not return a readable search-results payload. Open the results page and try again.")
+
+    results: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def visit(node):
+        if isinstance(node, dict):
+            renderer = node.get("videoRenderer")
+            if isinstance(renderer, dict):
+                video_id = str(renderer.get("videoId", "")).strip()
+                title_node = renderer.get("title") or {}
+                if isinstance(title_node, dict):
+                    runs = title_node.get("runs") or []
+                    title = "".join(str(item.get("text", "")) for item in runs if isinstance(item, dict))
+                    if not title:
+                        title = str(title_node.get("simpleText", ""))
+                else:
+                    title = ""
+                if re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id) and video_id not in seen:
+                    seen.add(video_id)
+                    results.append({"video_id": video_id, "title": title.strip() or "Untitled video"})
+            for value in node.values():
+                visit(value)
+        elif isinstance(node, list):
+            for value in node:
+                visit(value)
+
+    visit(initial_data)
+    if not results:
+        raise RuntimeError("No standard YouTube videos were found in those search results. Try a different search phrase.")
+    return results
+
+
+def play_youtube_result(index: int = 1) -> str:
+    """Open a numbered result from the last YouTube search, requesting autoplay."""
+    index = int(index)
+    if not 1 <= index <= 20:
+        raise ValueError("YouTube result number must be between 1 and 20.")
+    query = _LAST_YOUTUBE_SEARCH_QUERY
+    if not query:
+        raise RuntimeError("I do not have an active YouTube search. First say 'search YouTube for ...', then ask me to play a result.")
+
+    try:
+        import requests
+    except ImportError as exc:
+        raise RuntimeError("Selecting a YouTube result requires the existing requests dependency. Install the project requirements.") from exc
+
+    search_url = "https://www.youtube.com/results?search_query=" + quote_plus(query)
+    try:
+        response = requests.get(
+            search_url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"},
+            timeout=15,
+        )
+        response.raise_for_status()
+        results = _youtube_video_results_from_html(response.text)
+    except Exception as exc:
+        if isinstance(exc, RuntimeError):
+            raise
+        raise RuntimeError(f"Could not retrieve YouTube results for {query!r}: {exc}") from exc
+
+    if index > len(results):
+        raise RuntimeError(f"YouTube returned only {len(results)} video result(s); there is no result number {index}.")
+    selected = results[index - 1]
+    watch_url = f"https://www.youtube.com/watch?v={selected['video_id']}&autoplay=1"
+    if not webbrowser.open(watch_url, new=2):
+        raise RuntimeError("The default browser did not report that it opened the selected YouTube video.")
+    title = selected["title"]
+    return f"Opened YouTube video {index}: {title}. Autoplay was requested; browser autoplay settings may still require a click."
 
 
 def search_web(query: str) -> str:
@@ -153,6 +242,67 @@ def search_web(query: str) -> str:
     if not webbrowser.open(url, new=2):
         raise RuntimeError("The default browser did not report that it opened web search.")
     return f"Opened web search results for {query}."
+
+
+def _office_registry_path(executable: str) -> str | None:
+    """Find Click-to-Run Office executables through Windows App Paths/Office registry."""
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+    except ImportError:
+        return None
+    subkeys = [
+        fr"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{executable}",
+        fr"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\{executable}",
+    ]
+    office_app = {"winword.exe": "Word", "excel.exe": "Excel", "powerpnt.exe": "PowerPoint"}.get(executable.casefold())
+    if office_app:
+        for version in ("16.0", "15.0", "14.0"):
+            subkeys.extend([
+                fr"SOFTWARE\Microsoft\Office\{version}\{office_app}\InstallRoot",
+                fr"SOFTWARE\WOW6432Node\Microsoft\Office\{version}\{office_app}\InstallRoot",
+            ])
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        for subkey in subkeys:
+            try:
+                with winreg.OpenKey(hive, subkey) as key:
+                    for value_name in (None, "Path"):
+                        try:
+                            value, _kind = winreg.QueryValueEx(key, value_name)
+                        except OSError:
+                            continue
+                        candidate = str(value).strip().strip('"')
+                        if candidate and os.path.isdir(candidate) and office_app:
+                            candidate = str(Path(candidate) / executable)
+                        if candidate and os.path.isfile(candidate):
+                            return candidate
+            except OSError:
+                continue
+    return None
+
+
+def _office_start_menu_shortcut(app_label: str) -> str | None:
+    """Return a matching Office Start Menu shortcut, if present."""
+    if os.name != "nt":
+        return None
+    roots = [
+        Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs",
+        Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "Microsoft" / "Windows" / "Start Menu" / "Programs",
+    ]
+    matches = []
+    wanted = app_label.casefold()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        try:
+            for shortcut in root.rglob("*.lnk"):
+                name = shortcut.stem.casefold()
+                if wanted in name and ("office" in str(shortcut.parent).casefold() or "microsoft" in name or name in {"word", "excel", "powerpoint"}):
+                    matches.append(shortcut)
+        except OSError:
+            continue
+    return str(sorted(matches, key=lambda item: len(str(item)))[0]) if matches else None
 
 
 def open_app(name: str) -> str:
@@ -191,23 +341,80 @@ def open_app(name: str) -> str:
             fr"{program_files_x86}\Kingsoft\WPS Office\office6\{executable}",
         ]
     elif exe_key in {"winword.exe", "powerpnt.exe", "excel.exe"}:
-        candidates += [fr"{program_files}\Microsoft Office\root\Office16\{executable}", fr"{program_files_x86}\Microsoft Office\root\Office16\{executable}", fr"{program_files}\Microsoft Office\Office16\{executable}", fr"{program_files_x86}\Microsoft Office\Office16\{executable}"]
+        for office_version in ("Office16", "Office15", "Office14"):
+            candidates += [
+                fr"{program_files}\Microsoft Office\root\{office_version}\{executable}",
+                fr"{program_files_x86}\Microsoft Office\root\{office_version}\{executable}",
+                fr"{program_files}\Microsoft Office\{office_version}\{executable}",
+                fr"{program_files_x86}\Microsoft Office\{office_version}\{executable}",
+            ]
     elif exe_key == "msedge.exe":
         candidates += [fr"{program_files}\Microsoft\Edge\Application\msedge.exe", fr"{program_files_x86}\Microsoft\Edge\Application\msedge.exe"]
     found = next((candidate for candidate in candidates if os.path.isfile(candidate)), None)
+    if not found and exe_key in {"winword.exe", "powerpnt.exe", "excel.exe"}:
+        found = _office_registry_path(executable)
+        if not found:
+            label = {"winword.exe": "Word", "powerpnt.exe": "PowerPoint", "excel.exe": "Excel"}[exe_key]
+            found = _office_start_menu_shortcut(label)
     if found:
+        if found.lower().endswith(".lnk"):
+            os.startfile(found)  # type: ignore[attr-defined]
+            return f"Opened {key} using its Start Menu shortcut."
         command[0] = found
     elif shutil.which(executable) is None and not os.path.isfile(executable):
         # Keep the Python launcher command intact; py.exe is the supported version selector.
         if executable.lower() == "py" and shutil.which("py"):
             pass
-        elif executable.lower() in {"acad.exe", "picasa3.exe", "arduino-ide.exe", "wps.exe", "et.exe", "wpp.exe", "wpspdf.exe"}:
-            raise RuntimeError(f"{key} was not found at its common install location or on PATH. Check the app's installation path.")
+        elif executable.lower() in {"acad.exe", "picasa3.exe", "arduino-ide.exe", "wps.exe", "et.exe", "wpp.exe", "wpspdf.exe", "winword.exe", "powerpnt.exe", "excel.exe"}:
+            raise RuntimeError(
+                f"{key} was not found. Arthur checked PATH, common install folders, Office registry entries, "
+                "and the Start Menu. Confirm that the desktop application is installed; Store/web-only editions may need to be opened manually."
+            )
     try:
         subprocess.Popen(command, shell=False, close_fds=True)
     except FileNotFoundError as exc:
         raise RuntimeError(f"{key} was not found. It may not be installed or may not be on PATH.") from exc
     return f"Launched {key}."
+
+
+def close_application(name: str) -> str:
+    """Send a graceful close request to an explicitly allowlisted window; never kill a process."""
+    aliases = {
+        "word": ("word", "winword"), "excel": ("excel",),
+        "powerpoint": ("powerpoint",), "notepad": ("notepad",),
+        "calculator": ("calculator",), "file explorer": ("file explorer", "explorer"),
+        "chrome": ("chrome", "google chrome"), "edge": ("edge", "microsoft edge"),
+        "firefox": ("firefox",), "vscode": ("visual studio code", "vscode"),
+        "whatsapp": ("whatsapp",), "autocad": ("autocad",),
+        "arduino": ("arduino ide", "arduino"), "terminal": ("terminal", "windows terminal"),
+        "powershell": ("powershell",), "command prompt": ("command prompt", "cmd"),
+        "paint": ("paint",), "snipping tool": ("snipping tool",),
+    }
+    key = " ".join(str(name).casefold().split())
+    keywords = aliases.get(key)
+    if not keywords:
+        raise ValueError(f"Closing {name!r} is not supported. Choose a named application from Arthur's close-app allowlist.")
+    if os.name != "nt":
+        raise RuntimeError("Graceful application-window closing is currently supported only on Windows.")
+    try:
+        import pygetwindow
+    except ImportError as exc:
+        raise RuntimeError("Closing application windows requires pygetwindow. Install requirements-integrations.txt.") from exc
+    windows = [window for window in pygetwindow.getAllWindows() if window.title and window.title.strip()]
+    matches = [window for window in windows if any(term in window.title.casefold() for term in keywords)]
+    if not matches:
+        raise RuntimeError(f"No open {key} window was found. It may already be closed or have a different window title.")
+    # Prefer a visible, non-minimized matching window, then the shortest title.
+    matches.sort(key=lambda window: (bool(getattr(window, "isMinimized", False)), len(window.title)))
+    window = matches[0]
+    title = window.title.strip()
+    try:
+        closed = window.close()
+    except Exception as exc:
+        raise RuntimeError(f"Windows refused the close request for {title!r}: {exc}") from exc
+    if closed is False:
+        raise RuntimeError(f"Windows did not accept the close request for {title!r}.")
+    return f"Sent a normal close request to {title!r}. If the app has unsaved work, complete its save prompt."
 
 
 def open_folder(name: str, project_dir: Path) -> str:

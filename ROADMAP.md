@@ -4,7 +4,7 @@ This roadmap describes the engineering state of the integrated source and the ne
 
 ## Track 1 — Semantic command router
 
-**Implemented in source:** Whisper transcript input, Gemini function calling through registered typed tool declarations, deterministic parser/pattern fallback, SentenceTransformers semantic similarity fallback, typed `RoutedCommand`, and text-only Gemini fallback with a consent gate in the desktop client or a confirmation path in the API.
+**Implemented in source:** Whisper transcript input, Groq function calling through registered typed tool declarations, deterministic parser/pattern fallback, SentenceTransformers semantic similarity fallback, typed `RoutedCommand`, and direct text-only Groq fallback in both desktop and authenticated API clients; prior conversation context remains opt-in.
 
 **Next engineering gates:** Grow a paraphrase/argument test corpus; test dates, time zones, named contacts, multi-clause commands and low-confidence utterances; add clear clarification turns for arguments the model cannot safely infer; record route source and final execution status without logging private content.
 
@@ -17,6 +17,8 @@ This roadmap describes the engineering state of the integrated source and the ne
 ## Track 3 — Desktop workflow execution
 
 **Implemented in source:** Allowlisted window activation; paste/keyboard primitives; Gmail draft creation through a GUI workflow; Word document creation with unsaved review; WhatsApp Web draft entry; explicit separate send commands; and GUI target confirmation prompts.
+
+**Additional implementation:** Word active-document save/save-as, find-and-replace, and selection deletion are exposed as separate confirmed actions; Drive file-content/metadata update and Docs range deletion are available through the allowlisted Workspace executor.
 
 **Next engineering gates:** Verify the active target window and form-field focus after every step; add execution checkpoints with rollback/retry boundaries; improve screen/OCR verification across browser versions and accessibility settings; and test that interrupted workflows never continue in a newly focused window. Keep sends as a separately confirmed terminal action.
 

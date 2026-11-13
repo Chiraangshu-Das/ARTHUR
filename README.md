@@ -17,10 +17,11 @@ The current Indian Sign Language (ISL) implementation uses a Swin3D-S video clas
 ## Core behaviour
 
 - **Silent camera by default.** Camera capture and object detection do not trigger unsolicited scene narration. The user must request a scene description or OCR operation; proactive safety alerts remain disabled until explicitly enabled.
-- **Semantic intent routing.** A command is transcribed by local Whisper on the desktop (or by the selected mobile speech/Whisper path), then routed by Gemini function calling, the local command parser, high-value local intent patterns, and a SentenceTransformers similarity matcher. Routed calls select only tools in the typed registry. Unmatched requests can fall back to a text-only Gemini request after consent in the desktop client or a confirmation screen in the API client.
+- **Semantic intent routing.** A command is transcribed by local Whisper on the desktop (or by the selected mobile speech/Whisper path), then routed by Groq function calling, the local command parser, high-value local intent patterns, and a SentenceTransformers similarity matcher. Routed calls select only tools in the typed registry. Unmatched ordinary text requests are sent directly to Groq by the desktop or authenticated API client; prior conversation context remains opt-in, and external writes/sends/deletes and image uploads retain separate confirmation gates.
 - **Permissioned tool execution.** The model proposes an intent; a local executor validates arguments, allowlisted targets, device scope, and confirmation rules. Model-generated shell commands and arbitrary `eval` are never executed.
 - **Local-first processing.** Camera frames, audio recordings, screenshots, face templates, and local notes stay on-device unless a user-authorized operation explicitly sends selected content to a configured provider. The API's audio upload endpoint runs Whisper on the server machine and deletes its temporary upload afterward.
 - **Review before external actions.** Gmail/WhatsApp sends and Calendar writes require an explicit confirmation checkpoint. GUI workflows prepare editable drafts by default; they do not silently send or save them.
+- **Direct text-only AI fallback.** Unmatched ordinary text questions and tasks go straight to Groq without a second confirmation prompt. Only the current request is sent by default; prior conversation context stays local unless `VISIONGUIDE_SHARE_CONVERSATION_CONTEXT=1` is explicitly enabled. Image uploads and external state changes retain their separate confirmation checkpoints.
 - **Device-aware architecture.** Windows-specific actions execute on the machine running the Windows device agent. The mobile client sends commands and receives results; it does not automatically acquire control of another device's camera, display, cursor, or network adapter.
 
 ## Architecture
@@ -32,7 +33,7 @@ Windows desktop / mobile client / wearable client
           Whisper / client-native speech
                        |
              Semantic command router
-    Gemini function calling → local parser/patterns
+    Groq function calling → local parser/patterns
               → local embedding matcher
                        |
               typed allowlisted intent
@@ -53,7 +54,7 @@ The implementation entry points are:
 
 | Module | Implemented responsibility |
 |---|---|
-| `visionguide/semantic_router.py` | Gemini function-calling router, local parser/pattern fallback, SentenceTransformers semantic similarity, typed `RoutedCommand` results |
+| `visionguide/semantic_router.py` | Groq function-calling router, local parser/pattern fallback, SentenceTransformers semantic similarity, typed `RoutedCommand` results |
 | `visionguide/voice_commands.py` | Explicit microphone recording and local Whisper transcription, plus audio-file transcription for API uploads |
 | `visionguide/integrations/system_controls.py` | Browser playback shortcuts, display brightness, Windows master volume/mute, Windows adapter list/enable/disable |
 | `visionguide/integrations/timers.py` | Thread-safe countdown manager with cancellation and background expiry callbacks |
@@ -74,7 +75,7 @@ See `ARCHITECTURE.md`, `INTEGRATIONS.md`, `COMMAND_CATALOGUE.md`, and `GOOGLE_SC
 - Windows 10/11 x64 for the reference desktop client and Windows-specific integrations.
 - Python 3.11 x64 is the project runtime baseline.
 - Webcam and microphone for camera and voice features; keyboard/mouse and display for system automation.
-- `GEMINI_API_KEY` for Gemini function calling, visual Q&A, and text-only fallback.
+- `GROQ_API_KEY` for Groq function calling, visual Q&A, and text-only fallback.
 - A Google Cloud project with Gmail API and Google Calendar API enabled plus a Desktop OAuth client JSON for Workspace operations.
 - Tesseract OCR installed separately if using the Tesseract-backed local OCR path.
 - FFmpeg available on `PATH` for Whisper audio decoding.
@@ -112,7 +113,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\.venv\Scripts\Activate.ps1
 ```
 
-Edit `.env` and set `GEMINI_API_KEY`. `VISIONGUIDE_TIMEZONE` defaults to `Asia/Kolkata` and is used when routing natural-language calendar dates. The local semantic fallback uses `sentence-transformers/all-MiniLM-L6-v2`; its weights are downloaded by SentenceTransformers when first needed unless already cached. Configure `VISIONGUIDE_SEMANTIC_MODEL` and `VISIONGUIDE_SEMANTIC_THRESHOLD` to tune it.
+Edit `.env` and set `GROQ_API_KEY`. `VISIONGUIDE_TIMEZONE` defaults to `Asia/Kolkata` and is used when routing natural-language calendar dates. The local semantic fallback uses `sentence-transformers/all-MiniLM-L6-v2`; its weights are downloaded by SentenceTransformers when first needed unless already cached. Configure `VISIONGUIDE_SEMANTIC_MODEL` and `VISIONGUIDE_SEMANTIC_THRESHOLD` to tune it.
 
 ### Optional feature dependencies
 
@@ -142,11 +143,24 @@ Common launch options:
 ```powershell
 python main.py --camera 1
 python main.py --camera "http://192.168.1.20:8080/video"
+# Or set VISIONGUIDE_CAMERA_SOURCE="http://192.168.1.20:8080/video" in .env
 python main.py --confidence 0.40 --fps 6
 python main.py --cpu
 python main.py --no-speech
 python main.py --model "E:\path\to\another-model.pt"
 ```
+
+### Phone camera as the OCR / vision source
+
+For an Android phone, install a camera-streaming app such as IP Webcam, start its local server, and note the phone's LAN address and stream port. Keep the phone and PC on the same Wi-Fi network. A common MJPEG stream endpoint is `http://PHONE_IP:8080/video`; verify the exact URL shown by the phone app. Start Arthur with `python main.py --camera "http://PHONE_IP:8080/video"`, or set `VISIONGUIDE_CAMERA_SOURCE=http://PHONE_IP:8080/video` in `.env` and run `python main.py`. Use the numeric `0` source to return to the laptop webcam. The URL is used locally by OpenCV; do not forward the stream port to the public internet.
+
+A sharper phone camera helps only when it is focused on the page, well lit, held steady, and close enough for text to occupy a large part of the frame. If the stream is unavailable, confirm the phone and PC are on the same network and that the phone app is actively streaming.
+
+### Required model files and ZIP downloads
+
+A GitHub ZIP may contain small Git LFS pointer files instead of binary model weights. In a full Git clone, install Git LFS and run `git lfs pull`. If you only have a ZIP download, fetch the full model artifacts from the repository's release or documented model-artifact location; `git lfs pull` cannot work from a ZIP without the `.git` history. Check the file sizes and confirm that `.pt` files are binary model files, not short text files beginning with `version https://git-lfs.github.com/spec/v1`. Arthur reports this condition at startup. The MediaPipe hand model is separate and can be installed with `python tools/download_hand_model.py`.
+
+The ISL feature in this build is an isolated-label classifier, not continuous sentence translation. Its real trained Swin3D-S checkpoint is required; Python code or a Groq API key cannot replace that checkpoint.
 
 ## Windows and browser controls
 
@@ -163,6 +177,7 @@ Verify the target field before typing: generic desktop automation cannot reliabl
 ### System-wide gestures
 
 Run `python tools/download_hand_model.py` to install the MediaPipe Hand Landmarker model at `models/hand_landmarker.task`, then use **Hand gestures…** to enable or disable camera-based control.
+Run `python tools/verify_runtime_assets.py` to verify the YOLO, hand-tracking, and ISL model files and the 76-class ISL label map. The archive may contain Git LFS pointer text rather than the actual trained weights.
 
 The index finger moves the pointer, a thumb-index pinch clicks, vertical movement in the rightmost 18% of the camera view scrolls, and a quick horizontal swipe changes browser tabs (left = previous, right = next). The same pointer/pinch gestures can click keys on the unified Air virtual keyboard. The mapping is intentionally opt-in and has motion smoothing and cooldowns. Avoid it while entering passwords or handling sensitive screens; the PyAutoGUI emergency corner failsafe remains active.
 
@@ -178,13 +193,13 @@ This is a best-effort Python navigation prototype, not a certified navigation/sa
 
 Face recognition remains local and opt-in. OpenCV LBPH is preserved; when the optional DeepFace extra is installed and embeddings can be created for enrolled samples, the local embedding match is combined with LBPH, and conflicting predictions remain unknown. Install the optional extras only when needed with `pip install -r requirements-face.txt`. Enrol only consenting users; embeddings and samples stay in `data/faces/`.
 
-Use local profile preferences to remember a name of address. Public visual search is separate from enrolled-face recognition; it can return similar images/pages but does not prove a person's identity or an exact product model. Product research asks before sending a compressed camera image to Gemini and Google Cloud Vision.
+Use local profile preferences to remember a name of address. Public visual search is separate from enrolled-face recognition; it can return similar images/pages but does not prove a person's identity or an exact product model. Product research asks before sending a compressed camera image to Groq and Google Cloud Vision.
 
 For live Windows location support, run `pip install -r requirements-navigation.txt`, enable Windows Location services, and grant the desktop app permission when prompted. The Maps/Weather/Routes REST adapters work only when a valid key, enabled APIs and applicable billing/quotas are configured.
 
 ## Google Workspace OAuth setup
 
-The Google Workspace adapter exposes the expanded scope-aware operation set described in `GOOGLE_SCOPE_FEATURE_MATRIX.md`. Features include Calendar event/calendar management, Gmail messages/drafts/labels/settings/forwarding/delegates/notifications, Drive files/metadata/permissions/app-data/Apps Script/activity, Docs/Sheets/Slides edits, Tasks, People/Contacts and selected user-profile fields, Classroom courses/rosters/classwork/submissions/guardians, Meet REST records and artifacts, YouTube channel/video/playlist operations, Forms responses and watches, and OAuth-backed Gemini tuning/retriever operations.
+The Google Workspace adapter exposes the expanded scope-aware operation set described in `GOOGLE_SCOPE_FEATURE_MATRIX.md`. Features include Calendar event/calendar management, Gmail messages/drafts/labels/settings/forwarding/delegates/notifications, Drive files/metadata/permissions/app-data/Apps Script/activity, Docs/Sheets/Slides edits, Tasks, People/Contacts and selected user-profile fields, Classroom courses/rosters/classwork/submissions/guardians, Meet REST records and artifacts, YouTube channel/video/playlist operations, Forms responses and watches, and OAuth-backed Google Generative Language tuning/retriever operations (separate from the primary Groq assistant).
 
 Create a Desktop OAuth client and store its JSON at `credentials/google_oauth_client.json` (or set `GOOGLE_OAUTH_CLIENT_FILE`). OAuth tokens are stored separately per feature profile under `data/google_tokens/`. **Merge** needed variables from `.env.example` into your existing `.env`; do not replace an existing `.env` with the template. Each feature requests its own scope profile at first use; the app does not ask for the whole Google Auth Platform catalogue on every login. The associated API must also be enabled in Cloud Console, and sensitive/restricted scope verification, account role, API quotas, Workspace-admin policy and product eligibility can affect availability.
 
@@ -279,7 +294,7 @@ Arthur is not a certified mobility aid, a guarantee of path safety, or an emerge
 
 ## Expanded desktop, website, and Windows Settings allowlists
 
-The launcher and voice-command parser include LeetCode, Gemini, Netlify, Render, Claude, Google Classroom, Google Contacts, Google Cloud Console, Neon, LinkedIn Learning, Coursera, SWAYAM, NPTEL, Google Docs/Sheets/Meet, and other existing destinations. The `linkedln learning` and `swaym` aliases also normalize to their intended sites.
+The launcher and voice-command parser include LeetCode, Groq, Netlify, Render, Claude, Google Classroom, Google Contacts, Google Cloud Console, Neon, LinkedIn Learning, Coursera, SWAYAM, NPTEL, Google Docs/Sheets/Meet, and other existing destinations. The `linkedln learning` and `swaym` aliases also normalize to their intended sites.
 
 Additional desktop launch aliases include WhatsApp, Microsoft Edge, Microsoft PowerPoint, Microsoft Excel, WPS Office (Docs/Writer, Sheets, Slides, and PDF), Arduino IDE, AutoCAD 2026, Python IDLE for Python 3.14, Picasa 3, Photos, Media Player, Clock, and Recycle Bin. Third-party application launch depends on the app being installed and discoverable through its executable or a supported common install path.
 

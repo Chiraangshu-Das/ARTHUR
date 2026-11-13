@@ -1,0 +1,27 @@
+ARTHUR — Cross-application Typing + Enter Follow-up Upgrade
+Cumulative overlay includes the previous Direct Groq + Word/Google Workspace Save/Update/Delete patch, Productivity + Groq, YouTube context and related repair/personalization updates.
+
+NEW IN THIS UPDATE:
+  visionguide/integrations/gui_automation.py
+    - Windows UI Automation field discovery via pywinauto
+    - File Explorer / browser / Office / app search-field focus paths
+    - Exact focused-control identity capture and validation before Enter
+    - Confirmation classification for message composers and ambiguous forms
+  visionguide/semantic_router.py
+    - submit_typed_field follow-up command and natural-language aliases
+    - expanded app/site targeting for typing/search fields
+  visionguide/app.py
+    - remembers successful typing context for up to 120 seconds
+    - submits only in the same window and same focused UIA control
+    - clears context after unrelated commands or failures
+  requirements-integrations.txt
+    - adds pywinauto>=0.6.9,<0.7.0 for Windows UI Automation
+  tests/test_targeted_typing_and_browser_tabs.py
+    - routing, known shortcut, accessible-field, ambiguity and safe-Enter tests
+  FIELD_SUBMISSION_CONTEXT_UPGRADE.md
+    - detailed coverage, examples, safety and limitations
+
+PRESERVE:
+  .env, .venv, data, models, credentials, and all user-specific files.
+
+This patch does not permit arbitrary executable paths. Desktop app and website launching remains restricted to the project's built-in allowlists.

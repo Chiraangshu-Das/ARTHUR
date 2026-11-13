@@ -4,20 +4,20 @@ This guide maps each user-visible capability to its source adapter, runtime prer
 
 An integration being present in the source does not guarantee that its external service, model, hardware, account permissions or operating-system dependencies are configured. Follow the relevant setup and validation steps before relying on a capability.
 
-## 1. Gemini function calling and semantic fallback
+## 1. Groq function calling and semantic fallback
 
 **Source:** `visionguide/semantic_router.py`, `visionguide/cloud_ai.py`  
-**Configuration:** `GEMINI_API_KEY`, `GEMINI_MODEL`, `VISIONGUIDE_TIMEZONE`, `VISIONGUIDE_LOCAL_SEMANTIC`, `VISIONGUIDE_SEMANTIC_MODEL`, `VISIONGUIDE_SEMANTIC_THRESHOLD`.
+**Configuration:** `GROQ_API_KEY`, `GROQ_MODEL`, `VISIONGUIDE_TIMEZONE`, `VISIONGUIDE_LOCAL_SEMANTIC`, `VISIONGUIDE_SEMANTIC_MODEL`, `VISIONGUIDE_SEMANTIC_THRESHOLD`.
 
 Routing order:
 
-1. Gemini selects one declared typed function when configured.
+1. Groq selects one declared typed function when configured.
 2. The existing local command parser handles known deterministic commands.
 3. High-value local patterns handle simple brightness, volume, mute, Wi-Fi, timer, playback and unread-mail requests without an embedding model.
 4. SentenceTransformers compares unseen paraphrases against registered intent examples.
-5. If no local intent matches, desktop text-only fallback asks the user before sending the transcript to Gemini. The API client presents a confirmation before a text-only Gemini request.
+5. If no local intent matches, Arthur sends the ordinary text request directly to Groq from the desktop or authenticated API client. It does not ask for another “send to Groq?” confirmation. Previous conversation context is excluded unless `VISIONGUIDE_SHARE_CONVERSATION_CONTEXT=1` is enabled.
 
-The router uses `automatic_function_calling` disabled: Gemini returns a proposed function call but does not execute local Python. Only registered functions are accepted. Arguments are reduced to primitive JSON types and are checked again by the executor.
+The router uses `automatic_function_calling` disabled: Groq returns a proposed function call but does not execute local Python. Only registered functions are accepted. Arguments are reduced to primitive JSON types and are checked again by the executor.
 
 The local semantic matcher loads `sentence-transformers/all-MiniLM-L6-v2` on first use when needed. Set `VISIONGUIDE_LOCAL_SEMANTIC=0` to use the parser/pattern path without embedding inference. The first semantic-model load may download model weights unless they are already cached.
 
@@ -30,7 +30,7 @@ For Calendar expressions, `VISIONGUIDE_TIMEZONE` (default `Asia/Kolkata`) and cu
 
 On Windows, use the explicit voice-command capture button or the locally armed wake-word feature. `record_and_transcribe()` records a bounded interval at 16 kHz and sends it to local Whisper inference. `transcribe_audio_file()` reuses a cached Whisper model for a supplied audio path.
 
-The API `POST /api/v1/transcribe` accepts multipart audio and permits WAV, MP3, M4A, WebM, OGG, FLAC, MP4 or MPEG-family extensions up to 20 MB. It writes a temporary file, runs Whisper on the server machine, deletes the temporary file, and returns the transcript. This endpoint does not send audio to Gemini.
+The API `POST /api/v1/transcribe` accepts multipart audio and permits WAV, MP3, M4A, WebM, OGG, FLAC, MP4 or MPEG-family extensions up to 20 MB. It writes a temporary file, runs Whisper on the server machine, deletes the temporary file, and returns the transcript. This endpoint does not send audio to Groq.
 
 The mobile app's standard device-speech button uses the mobile speech plugin; the separate “Record for Whisper” path sends the audio to the configured device API for local Whisper processing. In this context, *local* means local to the machine running the API, not necessarily the phone.
 
@@ -79,13 +79,19 @@ The executor targets an allowlist of known windows. `activate_window()` finds a 
 
 `compose_gmail_gui(recipient, subject, body, send=False)` validates a single email address, opens Gmail, activates a Gmail window, uses the Gmail `C` keyboard shortcut, enters recipient/subject/body by clipboard paste, and leaves the compose window open for review. Enable Gmail keyboard shortcuts in Gmail settings. If the page layout or focus differs, stop and correct the draft instead of continuing blindly.
 
-The desktop command flow can accept an email recipient, subject and writing instructions; it asks before sending those instructions to Gemini, generates a proposed body, and inserts it into Gmail. The separate “send email” action asks the user to verify recipient, subject and body, then issues `Ctrl+Enter`. The result text explicitly says to verify the Sent state; sending a shortcut is not proof of delivery.
+The desktop command flow can accept an email recipient, subject and writing instructions; it sends the text drafting instructions directly to Groq, generates a proposed body, and inserts it into Gmail after a preview/confirmation checkpoint. The separate “send email” action asks the user to verify recipient, subject and body, then issues `Ctrl+Enter`. The result text explicitly says to verify the Sent state; sending a shortcut is not proof of delivery.
 
 The API can create an actual Gmail API draft through `POST /api/v1/workspace/gmail/drafts`. The send endpoint first reads the draft and returns its recipient, subject and body preview together with a one-use confirmation token. On confirmation, the server re-reads the draft and compares a fingerprint of recipient, subject and full body before sending; if the draft changed after preview, sending is rejected and the user must review it again.
 
 ### Word
 
 `word_write_document(text)` launches Word, creates a new document and pastes the text. It does not save or share the document. The user must review and save it.
+
+### Word save and edit operations
+
+- “Save it” saves the active Word document. An unnamed document is saved under `Documents/ARTHUR` with a timestamped filename. “Save Word document as report.docx” supplies a safe filename in that folder. Both require confirmation; existing files are not overwritten.
+- “Replace old text with new text in Word” previews and confirms the replacement before changing the active document. The document remains modified but unsaved.
+- “Delete selected text in Word” reads the current selection, previews it, and confirms before deleting. The helper verifies that the selection has not changed since preview. The document remains modified but unsaved.
 
 ### WhatsApp Web
 
@@ -171,13 +177,13 @@ Since pointer control is globally active while enabled, disable it before enteri
 
 Daily usage caps and a SQLite counter under `data/cache/` reduce accidental loops; caps are application-side only and do not replace Cloud quotas/budgets. Geolocation uploads Wi-Fi identifiers only when `consent_confirmed=True`; the module does not collect Wi-Fi identifiers itself.
 
-Cloud Vision Web Detection uses the separately restricted `GOOGLE_CLOUD_API_KEY` or `GOOGLE_VISION_API_KEY`; do not expect a Maps-only restricted key to work for Vision. Cloud Translation and Cloud Natural Language use separate OAuth scope profiles (`cloud-translation` and `cloud-language`) and do not use the Gemini API key. Enable Cloud Vision API only if image web-detection is required; enable Cloud Translation/Natural Language API in the OAuth project's Cloud project before using those actions. Their text inputs are sent to Google for processing but are not cached by this module.
+Cloud Vision Web Detection uses the separately restricted `GOOGLE_CLOUD_API_KEY` or `GOOGLE_VISION_API_KEY`; do not expect a Maps-only restricted key to work for Vision. Cloud Translation and Cloud Natural Language use separate OAuth scope profiles (`cloud-translation` and `cloud-language`) and do not use the Groq API key. Enable Cloud Vision API only if image web-detection is required; enable Cloud Translation/Natural Language API in the OAuth project's Cloud project before using those actions. Their text inputs are sent to Google for processing but are not cached by this module.
 
 The current Python desktop app does not embed Maps JavaScript, Android/iOS SDKs, Maps Embed, or Map Tiles renderers; those APIs are for browser/mobile/map-renderer clients rather than an ordinary Python REST adapter. The route preview opens a Google Maps URL, not an in-app SDK. Enable only the APIs needed by the client actually using them, restrict each key by API and application type, activate billing if required, and set quota/budget alerts. Verify current pricing and regional availability before relying on an endpoint.
 
 `NavigationSession` asks for Windows Runtime device location, speaks provider maneuver instructions, and recalculates after repeated route deviation. It opens a Google Maps route preview as well, but that browser preview is not a native in-app navigation SDK. Install `requirements-navigation.txt`, enable Windows Location and grant permission. GPS availability, route coverage, maneuver timing and rerouting need testing on the target Windows machine. This is best-effort prototype guidance, not a certified navigation or road-safety system.
 
-Camera-based product/visual search asks for explicit approval before the selected image goes to Gemini and Cloud Vision. Visual search can return public pages and similar-image leads; it is not identity verification. OCR text can be noisy, and product specifications should be checked against manufacturer sources/manuals.
+Camera-based product/visual search asks for explicit approval before the selected image goes to Groq and Cloud Vision. Visual search can return public pages and similar-image leads; it is not identity verification. OCR text can be noisy, and product specifications should be checked against manufacturer sources/manuals.
 
 ### Additional supported Google APIs
 

@@ -1,6 +1,6 @@
 # Arthur Spoken Command Catalogue
 
-Commands are natural-language intents, not magic exact strings. Gemini function calling routes common paraphrases to the same typed tool when configured. Local parsing/patterns and SentenceTransformers similarity provide fallback routing. If an argument cannot be safely inferred, ask for clarification rather than guessing.
+Commands are natural-language intents, not magic exact strings. Groq function calling routes common paraphrases to the same typed tool when configured. Local parsing/patterns and SentenceTransformers similarity provide fallback routing. If an argument cannot be safely inferred, ask for clarification rather than guessing.
 
 A recognized command is not proof that the requested action succeeded. Arthur must report execution results accurately and distinguish a completed action from an attempted action, an unavailable capability or a provider error.
 
@@ -60,7 +60,7 @@ A timer reminder is not automatically a persistent Calendar event or a scheduled
 
 The camera remains silent until asked. A detected object may be missed; not detecting an object is not proof that it is absent.
 
-Camera upload to Gemini requires a separate prompt/consent gate. Distance and hazard analysis are not certified mobility guidance. Proactive safety alerts should not be treated as a replacement for environmental awareness or mobility assistance.
+Camera upload to Groq requires a separate prompt/consent gate. Distance and hazard analysis are not certified mobility guidance. Proactive safety alerts should not be treated as a replacement for environmental awareness or mobility assistance.
 
 ## 6. Screen, OCR and documents
 
@@ -89,7 +89,7 @@ After configuring Google Cloud OAuth and authenticating:
 
 Gmail API operations support unread metadata/body, inbox search, reading by message ID, API draft creation and explicit draft send.
 
-The desktop GUI workflow opens Gmail, uses its compose shortcut, pastes the recipient, subject and Gemini-generated body, and leaves the draft open for review. To send from the active GUI draft, the user must separately say “send email” and confirm the displayed recipient/subject/body. Enable Gmail keyboard shortcuts for GUI compose.
+The desktop GUI workflow opens Gmail, uses its compose shortcut, pastes the recipient, subject and Groq-generated body, and leaves the draft open for review. To send from the active GUI draft, the user must separately say “send email” and confirm the displayed recipient/subject/body. Enable Gmail keyboard shortcuts for GUI compose.
 
 Never infer an email address from a person's name when no uniquely known address is supplied. Review the full message before sending. A send shortcut is not proof of delivery; verify Gmail's Sent state.
 
@@ -104,6 +104,15 @@ The router uses current date/time and `VISIONGUIDE_TIMEZONE`. The app must confi
 
 If the time, date or duration is unclear, clarify before writing. Current adapter supports upcoming event listing, metadata search and single-event creation; attendees and recurrence are not part of the current event form.
 
+For Google Drive and Docs, the extended allowlisted API adapter also exposes confirmed writes and deletes:
+
+- “Update Google Drive file [FILE_ID] with this content: [text].” (content upload requires confirmation)
+- “Update Google Drive file [FILE_ID] metadata to [JSON].” (metadata update requires confirmation)
+- “Delete Google Drive file [FILE_ID].” (requires confirmation)
+- “Delete content from Google Doc [DOCUMENT_ID] between index 10 and 25.” (range deletion requires confirmation)
+
+The operation must have a valid resource ID and the matching Google OAuth scope. Google Docs API changes are saved automatically after a confirmed API update.
+
 ## 9. Word, WhatsApp Web and window typing
 
 - “Open Word and write this draft: [dictated text].”
@@ -111,12 +120,20 @@ If the time, date or duration is unclear, clarify before writing. Current adapte
 - “Prepare a WhatsApp Web message to Alex: [message].”
 - “Send WhatsApp message.”
 - “Type this text in the Gmail window: [text].”
+- “Type hello in Microsoft Word.” (inserts at Word's current cursor/selection using Office automation; opens a blank document only if Word has none)
+- “Save it.” (saves the active Word document after confirmation; an unnamed document is saved with a timestamped name under `Documents/ARTHUR`)
+- “Save the Word document as report.docx.” (saves in `Documents/ARTHUR`; refuses to overwrite an existing file)
+- “Replace old phrase with new phrase in Word.” (previews and confirms the replacement; leaves the document modified but unsaved)
+- “Delete selected text in Word.” (previews the current selection and confirms; verifies the selection has not changed before deletion)
+- “Type Taylor Swift in YouTube search box.” (focuses the YouTube search field, pastes, and does not submit)
+- “Type example.com in Chrome address bar.” (focuses the browser omnibox and pastes, but does not navigate)
+- “Close YouTube.” / “Close the Gmail tab.” (asks for confirmation, then closes the matching active browser tab without terminating the browser)
 
-Word documents remain unsaved. WhatsApp drafts remain unsent. Text paste targets are allowlisted.
+Word text insertion and replacement leave the document unsaved until you explicitly say “save it” and confirm. WhatsApp drafts remain unsent. Text paste targets are allowlisted. Word operations require `pywin32` and a Windows desktop installation of Microsoft Word.
 
-Before sending a WhatsApp message, confirm the visible chat title and complete message body; before email send, confirm recipient, subject and body. A GUI workflow stops on a missing window or error.
+Before sending a WhatsApp message, confirm the visible chat title and complete message body; before email send, confirm recipient, subject and body. A GUI workflow stops on a missing window or error. Browser-tab closing only identifies the active tab shown in the Chrome/Edge/Firefox/Brave/Vivaldi/Opera window title; background tabs are not selected automatically.
 
-GUI typing depends on the intended window and input field being active. Arthur should not assume that text was entered into the correct application merely because a paste operation was attempted.
+For generic “Type exactly …”, Arthur captures the foreground window before confirmation, then restores and verifies that same window before pasting. If Arthur itself was foreground (for example, after clicking Push to Talk), name the target explicitly. Arbitrary webpage fields are not guessed: only known focus routes such as YouTube's search shortcut and the Chrome/Edge address bar are automated.
 
 ## 10. Unified system-wide air virtual keyboard and hand gestures
 
@@ -155,7 +172,7 @@ This is best-effort prototype guidance, not a certified mobility/navigation safe
 - “What product is this?”
 - “Search this object online.”
 
-Arthur asks for consent before uploading the compressed camera frame to Gemini and/or Google Cloud Vision. It can combine OCR, visual inference, public page matches and similar-image leads, with uncertainty called out.
+Arthur asks for consent before uploading the compressed camera frame to Groq and/or Google Cloud Vision. It can combine OCR, visual inference, public page matches and similar-image leads, with uncertainty called out.
 
 A visual match never proves a person's identity or an exact model number. Similar-image results should be treated as research leads, not definitive identification.
 
@@ -234,9 +251,9 @@ Scope consent, API enablement, verification, account role and product eligibilit
 - “Help me draft a project report outline.”
 - “What is the difference between threads and async tasks?”
 
-The desktop asks before sending unmatched transcript text to Gemini. The API's text-only fallback shows a confirmation screen.
+Unmatched ordinary text requests are sent directly to Groq by the desktop and authenticated API client. Arthur does not ask “send this to Groq?” or announce that a local command was not found. The current request text is sent; prior conversation context is not included unless `VISIONGUIDE_SHARE_CONVERSATION_CONTEXT=1` is enabled.
 
-General Gemini Q&A is text-only unless an image-specific action was explicitly requested and confirmed separately.
+General Groq Q&A is text-only unless an image-specific action was explicitly requested and confirmed separately. Sends, saves, updates, deletions, submissions, account changes, and image/screenshot uploads continue to use their own confirmation checkpoints.
 
 ## 16. Extended website launcher allowlist
 

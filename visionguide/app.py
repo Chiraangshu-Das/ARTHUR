@@ -14,7 +14,7 @@ from tkinter import ttk, messagebox, simpledialog, filedialog
 import cv2
 from PIL import Image, ImageTk
 
-from visionguide.cloud_ai import GeminiAssistant
+from visionguide.cloud_ai import GroqAssistant
 from visionguide.action_history import ActionHistory, summarize_recent_actions
 from visionguide.system_virtual_keyboard import SystemVirtualKeyboard
 from visionguide.depth import DepthWorker
@@ -22,7 +22,7 @@ from visionguide.documents import find_word, read_document, save_document
 from visionguide.document_search import search_document
 from visionguide.desktop_actions import (
     calculate_expression, calculator_calculate, capture_screen, check_internet_connectivity, find_latest_pdf,
-    image_file_to_bgr, open_app, open_document, open_folder, open_website, search_web, search_youtube, system_status,
+    image_file_to_bgr, open_app, close_application, open_document, open_folder, open_website, search_web, search_youtube, play_youtube_result, system_status,
 )
 from visionguide.engine import VisionWorker
 from visionguide.face_memory import FaceMemory
@@ -39,10 +39,17 @@ from visionguide.integrations.google_workspace import (
     calendar_create_event, calendar_search, calendar_upcoming, gmail_read_message, gmail_search, gmail_unread,
 )
 from visionguide.integrations.gui_automation import (
-    activate_window, compose_gmail_gui, compose_whatsapp_gui, send_current_whatsapp,
-    type_into_window, type_text_to_focused_window, focus_application_target, word_write_document,
+    activate_window, capture_foreground_window, close_website_tab, compose_gmail_gui,
+    field_submission_requires_confirmation, submit_typed_field, capture_focused_control_identity,
+    compose_whatsapp_gui, send_current_whatsapp, type_into_window,
+    type_text_to_focused_window, focus_application_target, word_write_document,
+    save_active_word_document, replace_text_in_active_word_document,
+    get_active_word_selection_text, delete_active_word_selection,
 )
 from visionguide.memory import LocalMemory
+from visionguide.conversation import ConversationContext
+from visionguide.voice_responses import natural_action_response
+from visionguide.personalization import normalize_preferred_name, personalize_spoken_response
 from visionguide.perception import Detection, draw_detections, summarize_scene
 from visionguide.safety import SafetyEngine
 from visionguide.scene_commands import parse_voice_command
@@ -69,19 +76,25 @@ class ArthurApp:
         self.face_memory = FaceMemory(self.data_dir)
         self.memory = LocalMemory(self.data_dir / "memory.sqlite3")
         self.action_history = ActionHistory(self.data_dir / "action_history.sqlite3")
+        self.conversation_context = ConversationContext(max_turns=8)
+        self.share_conversation_context = os.getenv("VISIONGUIDE_SHARE_CONVERSATION_CONTEXT", "0").strip().lower() in {"1", "true", "yes", "on"}
+        self._dispatch_turn_id: int | None = None
         self.maps_services = GoogleMapsServices(cache_path=self.data_dir / "cache" / "google_services.sqlite3")
         self.navigation_session: NavigationSession | None = None
         self.last_action_result = ""
         self.last_voice_transcript = ""
+        # Ephemeral target context for a two-step type -> Enter/search workflow.
+        self._pending_field_context: dict | None = None
         self._dispatch_context: tuple[str, str] | None = None
         self.face_overlay: list[tuple[int, int, int, int, str, float]] = []
         self._last_face_scan_at = 0.0
         self._face_scan_pending = False
         self._face_absence_since = 0.0
         self.active_face_profile: str | None = None
+        self.active_preferred_name: str | None = None
         self._last_greeted_profile: str | None = None
         self._unknown_greeted = False
-        self.gemini = GeminiAssistant()
+        self.gemini = GroqAssistant()
         self.command_router = SemanticCommandRouter(self.gemini)
         self.safety_engine = SafetyEngine()
         self.safety_enabled = False
@@ -102,6 +115,7 @@ class ArthurApp:
         self._conversation_lock = threading.Lock()
         self._camera_explicitly_enabled = False
         self._camera_task_lock = threading.Lock()
+        self._last_model_error_message = ""
         self.sign_enabled = False
         self.last_sign_spoken = ""
         self.last_sign_spoken_at = 0.0
@@ -117,8 +131,12 @@ class ArthurApp:
 
         self.root = tk.Tk()
         self.root.title("Arthur | AI Assistive Assistant")
-        self.root.geometry("1420x940")
-        self.root.minsize(1120, 820)
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        window_width = min(1420, max(900, screen_width - 60))
+        window_height = min(900, max(620, screen_height - 80))
+        self.root.geometry(f"{window_width}x{window_height}")
+        self.root.minsize(880, 600)
         self.root.configure(bg=self.BG)
         self._configure_styles()
         self._build_ui()
@@ -153,7 +171,21 @@ class ArthurApp:
                         font=("Segoe UI Semibold", 9), relief="flat")
 
     def _build_ui(self):
-        header = ttk.Frame(self.root, padding=(22, 16, 22, 10))
+        # Keep the full control set reachable on 1366x768 laptops and at high DPI.
+        scroll_host = ttk.Frame(self.root)
+        scroll_host.pack(fill="both", expand=True)
+        canvas = tk.Canvas(scroll_host, background=self.BG, highlightthickness=0, borderwidth=0)
+        scrollbar = ttk.Scrollbar(scroll_host, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        content = ttk.Frame(canvas)
+        canvas_window = canvas.create_window((0, 0), window=content, anchor="nw")
+        content.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(canvas_window, width=event.width))
+        canvas.bind_all("<MouseWheel>", lambda event: canvas.yview_scroll(int(-event.delta / 120), "units"))
+
+        header = ttk.Frame(content, padding=(22, 16, 22, 10))
         header.pack(fill="x")
         ttk.Label(header, text="Arthur", style="Header.TLabel").pack(side="left")
         ttk.Label(header, text="LOCAL ASSISTIVE-AI PROTOTYPE", foreground=self.ACCENT,
@@ -163,7 +195,7 @@ class ArthurApp:
         self.listening_button = self._button(header, "Listening: OFF", self.toggle_master_listening, primary=True)
         self.listening_button.pack(side="right", padx=(0, 12), pady=(3, 0))
 
-        body = ttk.Frame(self.root, padding=(18, 0, 18, 14))
+        body = ttk.Frame(content, padding=(18, 0, 18, 14))
         body.pack(fill="both", expand=True)
         body.columnconfigure(0, weight=3)
         body.columnconfigure(1, weight=2)
@@ -210,13 +242,13 @@ class ArthurApp:
                            "Use Describe scene to hear a summary, Scan / read text for OCR, or Voice command to record a short command.")
         self.output.configure(state="disabled")
 
-        controls = ttk.Frame(self.root, padding=(18, 0, 18, 8))
+        controls = ttk.Frame(content, padding=(18, 0, 18, 8))
         controls.pack(fill="x")
         for c in range(5): controls.columnconfigure(c, weight=1)
         control_items = [
             ("Find word on page", self.lookup_word),
-            ("Ask Gemini about view", lambda: self.ask_gemini(use_web_search=False)),
-            ("Ask Gemini + web", lambda: self.ask_gemini(use_web_search=True)),
+            ("Ask Groq about view", lambda: self.ask_gemini(use_web_search=False)),
+            ("Ask Groq + web", lambda: self.ask_gemini(use_web_search=True)),
             ("Text AI / email", self.ask_gemini_text),
             ("Save snapshot", self.save_snapshot),
             ("Remember info…", self.remember_info),
@@ -230,7 +262,7 @@ class ArthurApp:
             padx = (0, 5) if column == 0 else ((5, 0) if column == 4 else 5)
             self._button(controls, label, callback).grid(row=row, column=column, sticky="ew", padx=padx, pady=3)
 
-        promptbar = ttk.Frame(self.root, padding=(18, 0, 18, 8))
+        promptbar = ttk.Frame(content, padding=(18, 0, 18, 8))
         promptbar.pack(fill="x")
         promptbar.columnconfigure(1, weight=1)
         ttk.Label(promptbar, text="Keyboard / visual question:", background=self.BG, foreground=self.TEXT).grid(row=0, column=0, sticky="w", padx=(0, 8))
@@ -238,7 +270,7 @@ class ArthurApp:
         ttk.Entry(promptbar, textvariable=self.virtual_input_var).grid(row=0, column=1, sticky="ew", padx=(0, 8))
         self._button(promptbar, "Ask about view + text", self.ask_gemini_with_typed_prompt, primary=True).grid(row=0, column=2, sticky="e")
 
-        advanced = ttk.Frame(self.root, padding=(18, 0, 18, 8))
+        advanced = ttk.Frame(content, padding=(18, 0, 18, 8))
         advanced.pack(fill="x")
         for c in range(5): advanced.columnconfigure(c, weight=1)
         self._button(advanced, "Enable metric depth", self.toggle_depth).grid(row=0, column=0, sticky="ew", padx=(0, 5))
@@ -248,7 +280,7 @@ class ArthurApp:
         self._button(advanced, "ISL sign mode…", self.toggle_sign_mode).grid(row=0, column=4, sticky="ew", padx=(5, 0))
         self._button(advanced, "Calibrate gestures…", self.calibrate_gestures).grid(row=1, column=3, sticky="ew", padx=5, pady=(5, 0))
 
-        settings = ttk.Frame(self.root, style="Panel.TFrame", padding=(18, 10))
+        settings = ttk.Frame(content, style="Panel.TFrame", padding=(18, 10))
         settings.pack(fill="x", padx=18, pady=(0, 14))
         self.safety_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(settings, text="Depth-based spoken alerts (off by default)",
@@ -259,9 +291,47 @@ class ArthurApp:
         self._button(settings, "Enroll face…", self.enroll_face).pack(side="right", padx=(6, 0))
         self._button(settings, "Manage face memory…", self.manage_faces).pack(side="right", padx=6)
 
+        def adapt_columns(event):
+            compact = event.width < 1040
+            if compact:
+                left.grid_configure(row=0, column=0, columnspan=2, padx=0, pady=(0, 12), sticky="ew")
+                right.grid_configure(row=1, column=0, columnspan=2, padx=0, pady=0, sticky="ew")
+                body.columnconfigure(0, weight=1, minsize=0)
+                body.columnconfigure(1, weight=0, minsize=0)
+                body.rowconfigure(0, weight=0)
+                body.rowconfigure(1, weight=0)
+            else:
+                left.grid_configure(row=0, column=0, columnspan=1, padx=(0, 10), pady=0, sticky="nsew")
+                right.grid_configure(row=0, column=1, columnspan=1, padx=0, pady=0, sticky="nsew")
+                body.columnconfigure(0, weight=3, minsize=0)
+                body.columnconfigure(1, weight=2, minsize=0)
+                body.rowconfigure(0, weight=1)
+                body.rowconfigure(1, weight=0)
+        body.bind("<Configure>", adapt_columns)
+
     def _button(self, parent, text, command, primary=False):
         return ttk.Button(parent, text=text, command=command,
                           style="Primary.TButton" if primary else "Quiet.TButton")
+
+    def _activate_face_profile(self, profile_name: str | None) -> None:
+        """Switch the live user profile and immediately load its saved preferences."""
+        if not profile_name or not self.face_memory.is_enrolled_name(profile_name):
+            self.active_face_profile = None
+            self.active_preferred_name = None
+            return
+        self.active_face_profile = str(profile_name)
+        slug = self.face_memory.profile_slug(self.active_face_profile)
+        preferences = self.action_history.get_preferences(slug) if slug else {}
+        self.active_preferred_name = normalize_preferred_name(preferences.get("preferred_name"))
+
+    def _say(self, text: object, priority: bool = False, *, address_user: bool = True) -> None:
+        """Speak through one personalization boundary for local and AI responses."""
+        spoken = personalize_spoken_response(
+            text,
+            self.active_preferred_name,
+            address_user=address_user,
+        )
+        self.speech.say(spoken, priority=priority)
 
     @staticmethod
     def _parse_voice_confirmation(transcript: str) -> bool | None:
@@ -279,14 +349,14 @@ class ArthurApp:
         if not self.conversation_active:
             return messagebox.askyesno(title, message, parent=parent or self.root)
         prompt = f"{title}. {message[:1100]}. Please say yes or no."
-        self.speech.say(prompt[:1400])
+        self._say(prompt[:1400])
         self.speech.wait_until_idle(timeout=25.0)
         try:
             from visionguide.voice_commands import record_and_transcribe
-            response = record_and_transcribe(duration_seconds=5.0, model_name="base")
+            response = record_and_transcribe(duration_seconds=10.0, model_name="base")
         except Exception as exc:
             self._append_output(f"Voice confirmation failed closed: {exc}")
-            self.speech.say("I could not confirm that safely, so I cancelled the action.")
+            self._say("I could not confirm that safely, so I cancelled the action.")
             return False
         decision = self._parse_voice_confirmation(response)
         if decision is True:
@@ -294,10 +364,10 @@ class ArthurApp:
             return True
         if decision is False:
             self._append_output("Voice confirmation received: no. Action cancelled.")
-            self.speech.say("Cancelled, sir.")
+            self._say("Cancelled, sir.")
             return False
         self._append_output("No clear yes/no confirmation was transcribed. Action cancelled.")
-        self.speech.say("I did not hear a clear yes or no, so I cancelled the action.")
+        self._say("I did not hear a clear yes or no, so I cancelled the action.")
         return False
 
     def _set_output(self, text: str):
@@ -307,6 +377,9 @@ class ArthurApp:
         self.output.insert("1.0", text)
         self.output.configure(state="disabled")
         self.last_action_result = text
+        if self._dispatch_turn_id is not None:
+            success = not text.casefold().startswith(("action failed:", "error:", "failed:"))
+            self.conversation_context.set_result(self._dispatch_turn_id, text, success=success)
         if self._dispatch_context:
             action_name, transcript = self._dispatch_context
             # A result query must not overwrite the result it is asking about.
@@ -321,6 +394,9 @@ class ArthurApp:
         self.output.insert("end", "\n\n" + text)
         self.output.see("end")
         self.output.configure(state="disabled")
+        if self._dispatch_turn_id is not None:
+            success = not str(text).casefold().startswith(("action failed:", "error:", "failed:"))
+            self.conversation_context.set_result(self._dispatch_turn_id, text, success=success)
 
     def _refresh(self):
         if self._closed: return
@@ -338,8 +414,14 @@ class ArthurApp:
             depth_status, depth_error = "Depth not enabled", ""
         if status == "Camera/model error" and error:
             self.status_var.set("Camera/model error")
-            self._set_output(error)
-        elif self.depth_enabled and depth_status == "Depth unavailable":
+            if error != self._last_model_error_message:
+                message = "Camera/model error: " + error
+                self._set_output(message)
+                self._last_model_error_message = error
+                self._say("The camera or vision model could not start. The exact reason is displayed in the output panel.")
+        else:
+            self._last_model_error_message = ""
+        if status != "Camera/model error" and self.depth_enabled and depth_status == "Depth unavailable":
             self.status_var.set("Depth unavailable")
             if self.safety_enabled:
                 self.safety_enabled = False
@@ -381,7 +463,7 @@ class ArthurApp:
                         label, confidence = prediction
                         if label not in {"Uncertain sign"} and confidence >= 0.70 and (label != self.last_sign_spoken or time.monotonic() - self.last_sign_spoken_at > 2.5):
                             self._append_output(f"ISL isolated-sign prediction: {label} ({confidence:.0%}). This is not sentence-level translation.")
-                            self.speech.say(label)
+                            self._say(label)
                             self.last_sign_spoken = label
                             self.last_sign_spoken_at = time.monotonic()
                 except Exception as exc:
@@ -393,7 +475,7 @@ class ArthurApp:
             if self.safety_enabled:
                 for alert in alerts:
                     self._append_output("[DEPTH ALERT] " + alert)
-                    self.speech.say(alert, priority=True)
+                    self._say(alert, priority=True)
 
         self._draw_preview()
         if self.gesture_enabled and self.gesture_mouse is not None and self.latest_frame is not None and new_frame:
@@ -410,8 +492,8 @@ class ArthurApp:
 
     def _draw_preview(self):
         if self._closed or self.latest_frame is None: return
-        width = max(480, self.preview.winfo_width())
-        height = max(300, self.preview.winfo_height())
+        width = max(320, min(640, self.preview.winfo_width()))
+        height = max(180, min(360, self.preview.winfo_height()))
         image = draw_detections(self.latest_frame, self.latest_detections)
         if self.face_recognition_enabled:
             for x, y, w, h, label, _score in self.face_overlay:
@@ -504,13 +586,13 @@ class ArthurApp:
             self.latest_frame = None
             self.latest_detections = []
             self._append_output("Camera turned off.")
-            self.speech.say("Camera off, sir.")
+            self._say("Camera off, sir.")
             return
         try:
             self._camera_explicitly_enabled = True
             self.worker.start()
             self._append_output("Camera turned on. It will remain active until you turn it off or disable the master system.")
-            self.speech.say("Camera on, sir.")
+            self._say("Camera on, sir.")
         except Exception as exc:
             self._camera_explicitly_enabled = False
             messagebox.showerror("Camera could not start", str(exc))
@@ -522,7 +604,7 @@ class ArthurApp:
         except Exception as exc:
             text = f"I could not describe the scene: {exc}"
         self._set_output(text)
-        self.speech.say(text)
+        self._say(text)
 
     def scan_document(self):
         frame = self._require_frame()
@@ -542,7 +624,7 @@ class ArthurApp:
         else:
             response = f'Found “{query}” on {len(matches)} line(s):\n' + "\n".join(f"Line {n}: {line}" for n, line in matches[:30])
         self._set_output(response)
-        self.speech.say(response)
+        self._say(response)
 
     def save_snapshot(self):
         frame = self._require_frame()
@@ -587,18 +669,35 @@ class ArthurApp:
             self.worker.start()
             self._append_output("Local face recognition is enabled. Only manually enrolled names may be shown; unknown faces remain unknown.")
         else:
-            self.active_face_profile = None
+            self._activate_face_profile(None)
             self.face_overlay = []
             self._unknown_greeted = False
             self._append_output("Local face recognition is disabled.")
             self._maybe_stop_camera()
 
+    def _ask_voice_text(self, prompt: str, duration_seconds: float = 10.0) -> str:
+        """Ask for a short spoken value during a live conversation; no cloud upload."""
+        self._say(prompt)
+        self.speech.wait_until_idle(timeout=20.0)
+        from visionguide.voice_commands import record_and_transcribe
+        answer = record_and_transcribe(
+            duration_seconds=max(3.0, min(float(duration_seconds), 12.0)),
+            model_name="base",
+            stop_event=self._conversation_stop,
+        )
+        return " ".join(str(answer or "").split()).strip()
+
     def enroll_face(self):
         if not self.face_memory.available:
             messagebox.showerror("Face memory unavailable", "Face memory requires opencv-contrib-python. See README.md.")
             return
-        name = simpledialog.askstring("Enroll face", "Name/label for this consenting person:", parent=self.root)
-        if not name or not name.strip(): return
+        if self.conversation_active:
+            name = self._ask_voice_text("What name or label should I use for this consenting person?")
+        else:
+            name = simpledialog.askstring("Enroll face", "Name/label for this consenting person:", parent=self.root)
+        if not name or not name.strip():
+            self._say("Face enrollment cancelled because no name was provided.")
+            return
         approved = self._ask_yes_no("Consent required",
             f"Confirm that {name.strip()} knows their face samples will be stored locally on this computer for recognition. Continue?")
         if not approved: return
@@ -613,8 +712,12 @@ class ArthurApp:
             crops = []
             last_sample = 0.0
             deadline = time.monotonic() + 20
+            camera_error = ""
             while time.monotonic() < deadline and len(crops) < 10 and not self._closed:
-                frame, _, _, _, _, _ = self.worker.snapshot()
+                frame, _, _, camera_status, camera_detail, _fps = self.worker.snapshot()
+                if camera_status == "Camera/model error":
+                    camera_error = camera_detail or "The camera or object-detection model could not start."
+                    break
                 if frame is not None and time.monotonic() - last_sample > 0.45:
                     faces = self.face_memory.detect_faces(frame)
                     if len(faces) == 1:
@@ -622,8 +725,10 @@ class ArthurApp:
                         last_sample = time.monotonic()
                 time.sleep(0.08)
             try:
+                if camera_error:
+                    raise RuntimeError(camera_error)
                 count = self.face_memory.enroll(name.strip(), crops)
-                self._async_messages.put(("message", ("Face enrollment complete", f"Saved {count} new samples for {name.strip()} locally.")))
+                self._async_messages.put(("face_enrolled", (name.strip(), count)))
             except Exception as exc:
                 self._async_messages.put(("error", ("Face enrollment failed", str(exc))))
             finally:
@@ -647,7 +752,7 @@ class ArthurApp:
             if deleted:
                 self.action_history.delete_preferences(profile_slug)
                 if self.active_face_profile and self.active_face_profile.casefold() == selected.strip().casefold():
-                    self.active_face_profile = None
+                    self._activate_face_profile(None)
                 self._append_output(f"Deleted face samples, local recognition data, and profile preferences for {selected.strip()}.")
             else: messagebox.showinfo("Not found", "That name was not in local memory.")
         except Exception as exc:
@@ -673,7 +778,10 @@ class ArthurApp:
             self._append_output("System-wide hand gestures enabled. Move the index finger, pinch to click, use the right-edge strip to scroll, and swipe left/right quickly to switch tabs. The same gestures can select keys on the air virtual keyboard.")
         except Exception as exc:
             self.gesture_mouse = None
-            messagebox.showerror("Air mouse could not start", str(exc))
+            message = f"Hand tracking could not start: {exc}"
+            self._set_output(message)
+            self._say("Hand tracking could not start. I have displayed the missing dependency or model requirement.")
+            messagebox.showerror("Air mouse could not start", str(exc), parent=self.root)
 
     def calibrate_gestures(self):
         if not self.gesture_enabled or self.gesture_mouse is None:
@@ -702,7 +810,7 @@ class ArthurApp:
             controller.begin_calibration("lower_right")
         elif state == "complete":
             self._append_output("Hand-pointer calibration saved in memory for this run. You can repeat the wizard if camera position changes.")
-            self.speech.say("Hand pointer calibration complete.")
+            self._say("Hand pointer calibration complete.")
             return
         elif state == "failed":
             messagebox.showwarning("Gesture calibration did not complete", "Keep one hand in view and use farther-apart upper-left and lower-right points, then repeat calibration.", parent=self.root)
@@ -719,7 +827,7 @@ class ArthurApp:
             memory_id = self.memory.add(note)
             message = f"Saved memory {memory_id} locally."
             self._append_output(message)
-            self.speech.say(message)
+            self._say(message)
         except Exception as exc:
             messagebox.showerror("Could not save memory", str(exc))
 
@@ -736,7 +844,7 @@ class ArthurApp:
                     f"ID {row['id']} · {row['created_at']}\n{row['content']}" for row in rows
                 )
             self._set_output(result)
-            self.speech.say(result[:5000])
+            self._say(result[:5000], address_user=False)
         except Exception as exc:
             messagebox.showerror("Memory search failed", str(exc))
 
@@ -755,7 +863,7 @@ class ArthurApp:
             return
         deleted = self.memory.delete_matching(query.strip())
         self._append_output(f"Deleted {deleted} local memory entr(y/ies).")
-        self.speech.say(f"Deleted {deleted} local memory entries.")
+        self._say(f"Deleted {deleted} local memory entries.")
 
     def toggle_depth(self):
         if self.depth_enabled:
@@ -833,7 +941,7 @@ class ArthurApp:
         except Exception as exc:
             self.system_virtual_keyboard = None
             messagebox.showerror("System virtual keyboard could not start", str(exc))
-            self.speech.say("The system virtual keyboard could not start. Please check the displayed error.")
+            self._say("The system virtual keyboard could not start. Please check the displayed error.")
 
     def toggle_sign_mode(self):
         if self.sign_enabled:
@@ -853,7 +961,10 @@ class ArthurApp:
             self.worker.start()
             self._append_output("ISL isolated-sign recognition enabled. This model does not translate continuous sentences and may be inaccurate.")
         except Exception as exc:
-            messagebox.showerror("ISL model unavailable", str(exc))
+            message = f"ISL isolated-sign mode could not start: {exc}"
+            self._set_output(message)
+            self._say("ISL sign recognition could not start. The reason is displayed in the output panel.")
+            messagebox.showerror("ISL model unavailable", str(exc), parent=self.root)
 
     def _stop_sign_mode(self):
         self.sign_enabled = False
@@ -867,19 +978,35 @@ class ArthurApp:
         question = simpledialog.askstring("Text-only AI", "Ask a general question, draft an email, summarize text, or request a writing task. No camera image will be sent:", parent=self.root)
         if not question or not question.strip():
             return
-        if not self._ask_yes_no("Send text to Gemini?", "This sends the text you entered to Google's Gemini API. No camera image is attached. Continue?"):
-            return
-        use_web_search = self._ask_yes_no("Use web search?", "Allow Gemini to use Google Search grounding for this text-only request? Choose No for a text-only AI response without Search grounding.")
-        self.status_var.set("Waiting for text-only AI response…")
-        self._set_output("Sending your requested text-only prompt…")
-        self._run_async("text_ai", lambda: self.gemini.ask_text(question.strip(), use_web_search=use_web_search))
+        # Clicking the text-only AI action is already an explicit user request. Do not
+        # add a second disclosure dialog for routine text prompts; image uploads remain gated.
+        self._submit_voice_text_ai(question.strip())
 
     def _submit_voice_text_ai(self, prompt: str):
-        if not self._ask_yes_no("Send text to Gemini?", "This sends only your transcribed words to Gemini. No camera image is attached. Continue?"):
+        prompt = str(prompt or "").strip()
+        if not prompt:
             return
-        use_web_search = self._ask_yes_no("Use web search?", "Allow Google Search grounding for this request?")
-        self.status_var.set("Waiting for text-only AI response…")
-        self._run_async("text_ai", lambda: self.gemini.ask_text(prompt, use_web_search=use_web_search))
+        if not self.gemini.available():
+            message = "Groq is not configured. Add GROQ_API_KEY to your local .env file and restart Arthur."
+            self._set_output(message)
+            self._say(message)
+            return
+        turn_id = self._dispatch_turn_id
+        recent_context = self.conversation_context.render(exclude_turn_id=turn_id)
+        context_to_send = recent_context if self.share_conversation_context else ""
+        self.status_var.set("Waiting for Groq response…")
+        self._set_output("Working on your request…")
+        # Text-only requests go directly to Groq. Recent conversation remains local unless
+        # VISIONGUIDE_SHARE_CONVERSATION_CONTEXT=1 was deliberately enabled in .env.
+        # Explicit web-search requests are routed to the separate web_search function.
+        self._run_async(
+            "text_ai",
+            lambda: self.gemini.ask_text(
+                prompt,
+                use_web_search=False,
+                conversation_context=context_to_send,
+            ),
+        )
 
     def ask_gemini_with_typed_prompt(self):
         question = self.virtual_input_var.get().strip()
@@ -888,46 +1015,54 @@ class ArthurApp:
             return
         frame = self._require_frame()
         if frame is None: return
-        approved = self._ask_yes_no("Send image to Gemini?", "This will upload the current camera image and your question to Google Gemini. The image may include people or private information. Proceed?")
+        approved = self._ask_yes_no("Send image to Groq?", "This will upload the current camera image and your question to Groq. The image may include people or private information. Proceed?")
         if not approved: return
         self._run_async("gemini", lambda: self.gemini.ask_about_frame(question, frame, False))
 
     def ask_gemini(self, use_web_search: bool):
         frame = self._require_frame()
         if frame is None: return
-        question = simpledialog.askstring("Ask Gemini", "Question about the current camera image:", parent=self.root)
+        question = simpledialog.askstring("Ask Groq", "Question about the current camera image:", parent=self.root)
         if not question or not question.strip(): return
         action = " and a web search" if use_web_search else ""
-        approved = self._ask_yes_no("Send image to Gemini?",
-            "This action will upload the current camera image and your question to the Google Gemini API" + action + ". "
+        approved = self._ask_yes_no("Send image to Groq?",
+            "This action will upload the current camera image and your question to the Groq API" + action + ". "
             "The image may include people or private information. Proceed only if you are comfortable sharing it.")
         if not approved: return
-        self.status_var.set("Waiting for Gemini response…")
+        self.status_var.set("Waiting for Groq response…")
         self._set_output("Sending the requested image question…")
         self._run_async("gemini", lambda: self.gemini.ask_about_frame(question.strip(), frame, use_web_search))
 
     def voice_command(self):
-        if not self._ask_yes_no("Record voice command", "Record up to 5 seconds from your microphone? "
-            "Audio will be transcribed locally with Whisper when installed; it is not sent to Gemini by this action."):
+        if not self._ask_yes_no("Record voice command", "Record up to 10 seconds from your microphone? "
+            "Audio will be transcribed locally with Whisper when installed; it is not sent to Groq by this action."):
             return
         if self.wake_word_listener is not None:
             self.wake_word_listener.stop()
             self.wake_word_listener = None
-        self.status_var.set("Recording voice command for 5 seconds…")
+        self.status_var.set("Recording voice command for up to 10 seconds…")
         self._run_async("voice", self._record_voice)
 
     @staticmethod
     def _record_voice():
         from visionguide.voice_commands import record_and_transcribe
-        return record_and_transcribe(duration_seconds=5.0, model_name="base")
+        return record_and_transcribe(duration_seconds=10.0, model_name="base")
 
     def _run_async(self, action: str, function):
+        # The dispatch turn ID is captured on the Tk thread before this worker starts.
+        # This lets late AI/API results be associated with the correct conversation turn.
+        conversation_turn_id = self._dispatch_turn_id
+
         def run():
             try:
                 result = function()
                 self._async_messages.put((action, result))
+                if conversation_turn_id is not None:
+                    self._async_messages.put(("conversation_result", (conversation_turn_id, result, True)))
             except Exception as exc:
                 self._async_messages.put(("error", (action, str(exc))))
+                if conversation_turn_id is not None:
+                    self._async_messages.put(("conversation_result", (conversation_turn_id, str(exc), False)))
         threading.Thread(target=run, name=f"visionguide-{action}", daemon=True).start()
 
     def _drain_async_messages(self):
@@ -950,13 +1085,13 @@ class ArthurApp:
                     self._conversation_stop.set()
                     self.status_var.set("Wake-word listening active" if self.wake_word_armed else "Listening disabled")
                     if reason == "timeout":
-                        self.speech.say("I'll wait for you, sir.")
+                        self._say("I'll wait for you, sir.")
                     elif reason == "sleep":
-                        self.speech.say("Sleeping now, sir.")
+                        self._say("Sleeping now, sir.")
                     elif reason == "goodbye":
-                        self.speech.say("Goodbye, sir.")
+                        self._say("Goodbye, sir.")
                     else:
-                        self.speech.say("Okay, sir. I'll wait for you.")
+                        self._say("Okay, sir. I'll wait for you.")
                     if self.wake_word_armed:
                         def restart_after_response():
                             self.speech.wait_until_idle(timeout=15.0)
@@ -969,7 +1104,7 @@ class ArthurApp:
                     self.conversation_active = False
                     self._conversation_stop.set()
                     self._append_output("Continuous listening stopped: " + str(result))
-                    self.speech.say("I had a microphone or transcription error, sir.")
+                    self._say("I had a microphone or transcription error, sir.")
                     if self.wake_word_armed:
                         self.root.after(1000, self._restart_wake_word_listener)
                 elif action == "wake_error":
@@ -980,7 +1115,7 @@ class ArthurApp:
                         self.wake_word_listener = None
                     message = "Wake-word listener stopped: " + str(result)
                     self._append_output(message)
-                    self.speech.say("Wake word mode stopped because of an error.")
+                    self._say("Wake word mode stopped because of an error.")
                     messagebox.showerror("Wake word mode", message)
                 elif action in {"ocr", "screen_ocr"}:
                     self.latest_ocr = str(result).strip()
@@ -988,17 +1123,30 @@ class ArthurApp:
                         save_path = save_document(self.latest_ocr, self.data_dir / "documents")
                         self._set_output(self.latest_ocr + f"\n\nSaved local text copy: {save_path}")
                         spoken = self.latest_ocr[:6000]
-                        self.speech.say(spoken)
+                        self._say(spoken, address_user=False)
                     else:
                         self._set_output("No readable text was found. Try holding the page flat, filling the frame, improving light, and scanning again.")
-                        self.speech.say("I could not read text on this page. Try holding it steady in better light.")
+                        self._say("I could not read text on this page. Try holding it steady in better light.")
                 elif action in {"gemini", "text_ai"}:
                     self._set_output(str(result))
-                    self.speech.say(str(result)[:6000])
+                    self._say(str(result)[:6000])
                     self.status_var.set("AI response received")
+                elif action == "youtube_select_result":
+                    message = str(result)
+                    self._set_output(message)
+                    self._say(message)
+                    self.status_var.set("YouTube video opened")
+                    self._record_async_action(action, message)
                 elif action == "route":
-                    transcript, routed = result
-                    self._dispatch_routed_command(str(transcript), routed)
+                    if isinstance(result, (tuple, list)) and len(result) == 3:
+                        transcript, routed, turn_id = result
+                    else:  # Backward-compatible with any already queued legacy route result.
+                        transcript, routed = result
+                        turn_id = None
+                    self._dispatch_routed_command(str(transcript), routed, turn_id=turn_id)
+                elif action == "conversation_result":
+                    turn_id, response, success = result
+                    self.conversation_context.set_result(int(turn_id), response, success=bool(success))
                 elif action == "face_scan":
                     self._face_scan_pending = False
                     matches = list(result or [])
@@ -1010,23 +1158,21 @@ class ArthurApp:
                         if len(matches) == 1 and len(known_profiles) == 1:
                             matched_name = known_profiles[0]
                             if matched_name != self.active_face_profile:
-                                self.active_face_profile = matched_name
+                                self._activate_face_profile(matched_name)
                                 self._last_greeted_profile = matched_name
                                 self._unknown_greeted = False
-                                slug = self.face_memory.profile_slug(matched_name)
-                                prefs = self.action_history.get_preferences(slug) if slug else {}
-                                greeting = prefs.get("preferred_name") or matched_name
-                                self.speech.say(f"Hello, {greeting}.")
+                                greeting = self.active_preferred_name or matched_name
+                                self._say(f"Hello, {greeting}.")
                         else:
-                            self.active_face_profile = None
+                            self._activate_face_profile(None)
                             if not self._unknown_greeted:
-                                self.speech.say("Hello. I do not recognize this view as one enrolled person. What would you like me to call you?")
+                                self._say("Hello. I do not recognize this view as one enrolled person. What would you like me to call you?")
                                 self._unknown_greeted = True
                     else:
                         if not self._face_absence_since:
                             self._face_absence_since = time.monotonic()
                         elif time.monotonic() - self._face_absence_since >= 2.5:
-                            self.active_face_profile = None
+                            self._activate_face_profile(None)
                             self._unknown_greeted = False
                             self._last_greeted_profile = None
                 elif action == "navigation_update":
@@ -1045,39 +1191,78 @@ class ArthurApp:
                             message += preview_note
                         self._set_output(message)
                         spoken_message = str(getattr(update, "message", message))
-                        self.speech.say(spoken_message[:2400], priority=(kind in {"instruction", "rerouted", "arrived"}))
+                        self._say(spoken_message[:2400], priority=(kind in {"instruction", "rerouted", "arrived"}))
                         self._record_async_action("navigation_" + str(kind), message, success=kind != "location_error")
                     if kind == "arrived" and self.navigation_session is not None:
                         self.navigation_session = None
-                elif action in {"weather", "route_calculation", "product_lookup", "typed_text", "calculator"}:
+                elif action in {"typed_text", "type_into_window"}:
+                    if isinstance(result, dict):
+                        message = str(result.get("message", "Typing completed."))
+                        if not result.get("focus_identity"):
+                            message += " Windows could not expose a stable focused-control identity, so Arthur cannot safely automate a follow-up Enter here; press Enter manually."
+                        self._pending_field_context = {
+                            "target_hwnd": int(result.get("target_hwnd", 0) or 0),
+                            "target_title": str(result.get("target_title", "")),
+                            "target": str(result.get("target", "foreground application")),
+                            "element": str(result.get("element", "text field")),
+                            "focus_identity": result.get("focus_identity"),
+                            "typed_at": time.monotonic(),
+                        }
+                    else:
+                        message = str(result)
+                        self._pending_field_context = None
+                    self._set_output(message)
+                    self._say(message[:4500])
+                    self._record_async_action(action, message)
+                    self.status_var.set("Text entered — ready for Enter/search")
+                elif action == "field_submit":
+                    message = str(result)
+                    self._pending_field_context = None
+                    self._set_output(message)
+                    self._say(message[:2500])
+                    self._record_async_action(action, message)
+                    self.status_var.set("Field submitted")
+                elif action in {"weather", "route_calculation", "product_lookup", "calculator"}:
                     message = str(result)
                     self._set_output(message)
-                    self.speech.say(message[:4500])
+                    self._say(message[:4500])
                     self._record_async_action(action, message)
                     self.status_var.set("Action completed")
                 elif action == "navigation_start":
-                    # The session's started callback contains the spoken route summary.
-                    self._record_async_action(action, result)
+                    # Normal success is announced by NavigationSession's callback. A string
+                    # result means live start failed but a static Google Maps fallback opened.
+                    if isinstance(result, str) and result.strip():
+                        self._set_output(result)
+                        self._say(result[:2200])
+                        self._record_async_action(action, result, success=False)
+                    else:
+                        self._record_async_action(action, result)
                 elif action == "draft_text":
                     draft = str(result).strip()
                     self._set_output("Draft preview — review the content before pasting. Nothing has been sent.\n\n" + draft)
-                    self.speech.say("The draft is ready for review. It has not been sent.")
+                    self._say("The draft is ready for review. It has not been sent.")
                     self._record_async_action(action, draft)
-                    if draft and self._ask_yes_no("Paste reviewed draft?", "The full draft is shown in the Arthur output panel. Paste it into your currently focused Windows text field? It will not be submitted or sent. After Yes, you have four seconds to select the target application and field.", parent=self.root):
-                        self.status_var.set("Draft will be pasted in four seconds — select the target field now.")
-                        self.speech.say("Select the target application and field within four seconds.")
-                        self._run_async("typed_text", lambda: self._paste_after_focus_delay(draft, 4.0))
+                    if draft and self._ask_yes_no("Paste reviewed draft?", "The full draft is shown in the Arthur output panel. Paste it into the window that was focused when you asked Arthur to draft it? It will not be submitted or sent.", parent=self.root):
+                        captured = getattr(self, "_pending_type_target", (0, ""))
+                        self.status_var.set("Pasting the reviewed draft into the original target window…")
+                        def _paste_reviewed_draft():
+                            message = type_text_to_focused_window(draft, captured[0])
+                            return {"message": message, "target_hwnd": captured[0], "target_title": captured[1],
+                                    "target": "foreground application", "element": "text field",
+                                    "focus_identity": capture_focused_control_identity()}
+                        self._run_async("typed_text", _paste_reviewed_draft)
+                    self._pending_type_target = None
                 elif action == "workspace":
                     message = self._format_workspace_result(result)
                     self._set_output(message)
-                    self.speech.say(message[:3200])
+                    self._say(message[:3200])
                     self.status_var.set("Google Workspace action complete")
                 elif action == "timer_expired":
                     timer_id, label = result
                     message = f"Timer {timer_id} finished: {label}."
                     self._append_output(message)
                     self.status_var.set("Timer completed")
-                    self.speech.say(message, priority=True)
+                    self._say(message, priority=True)
                 elif action in {"voice", "wakevoice"}:
                     transcript = str(result).strip()
                     if transcript:
@@ -1085,10 +1270,17 @@ class ArthurApp:
                         self._route_voice_command(transcript)
                     else:
                         self._append_output("No clear speech was transcribed. Try again in a quieter place.")
-                        self.speech.say("I could not understand the voice command. Please try again.")
+                        self._say("I could not understand the voice command. Please try again.")
                     self.status_var.set("Ready — audio is on demand")
                     if self.wake_word_armed and not self.conversation_active:
                         self.root.after(900, self._restart_wake_word_listener)
+                elif action == "face_enrolled":
+                    profile_name, sample_count = result
+                    self._activate_face_profile(str(profile_name))
+                    message = f"Face enrollment complete. Saved {sample_count} face samples locally for {profile_name}."
+                    self._append_output(message)
+                    messagebox.showinfo("Face enrollment complete", message)
+                    self._say(message)
                 elif action == "message":
                     title, body = result
                     self._append_output(body)
@@ -1101,6 +1293,8 @@ class ArthurApp:
                         self._face_scan_pending = False
                     if title == "navigation_start":
                         self.navigation_session = None
+                    if title in {"typed_text", "type_into_window", "field_submit"}:
+                        self._pending_field_context = None
                     self._set_output(f"Action failed: {body}")
                     self._record_async_action(str(title), str(body), success=False)
                     messagebox.showerror("Arthur", f"{title}\n\n{body}")
@@ -1111,14 +1305,25 @@ class ArthurApp:
             pass
         self.root.after(120, self._drain_async_messages)
 
-    @staticmethod
-    def _paste_after_focus_delay(text: str, delay_seconds: float = 4.0) -> str:
-        # Give the user time to activate the intended application after a modal confirmation.
-        time.sleep(max(0.5, min(float(delay_seconds), 8.0)))
-        return type_text_to_focused_window(text)
 
     def _calculate_and_open_route(self, origin: str, destination: str, mode: str) -> str:
-        route = self.maps_services.compute_route(origin, destination, mode, traffic_aware=True)
+        try:
+            route = self.maps_services.compute_route(origin, destination, mode, traffic_aware=True)
+        except Exception as exc:
+            # Static browser directions are still useful when Routes API credentials,
+            # billing, API enablement, quota, or geocoding are unavailable. Do not invent ETA.
+            try:
+                self.maps_services.open_route_in_maps(origin, destination, mode)
+            except Exception as browser_exc:
+                raise RuntimeError(
+                    f"Routes API failed: {exc}. Google Maps browser fallback also failed: {browser_exc}. "
+                    "Check GOOGLE_MAPS_API_KEY, enable Routes API and Geocoding API, and confirm billing is active."
+                ) from exc
+            return (
+                "I could not retrieve a verified route summary from the Routes API, but I opened Google Maps "
+                f"with directions from {origin} to {destination}. No ETA or turn-by-turn steps are available "
+                f"inside Arthur for this request. Routes API diagnostic: {exc}"
+            )
         mode_label = {
             "DRIVE": "car", "TWO_WHEELER": "motorcycle/two-wheeler", "WALK": "walking",
             "BICYCLE": "bicycle", "TRANSIT": "public transport",
@@ -1181,11 +1386,11 @@ class ArthurApp:
                 "When web search is available, cite or name the source/website used. Keep the answer concise and useful."
             )
             try:
-                sections.append("Gemini visual research:\n" + self.gemini.ask_about_frame(prompt, frame, True))
+                sections.append("Groq visual research:\n" + self.gemini.ask_about_frame(prompt, frame, True))
             except Exception as exc:
-                sections.append(f"Gemini research was unavailable: {exc}")
+                sections.append(f"Groq research was unavailable: {exc}")
         else:
-            sections.append("Gemini visual research was skipped because GEMINI_API_KEY is not configured.")
+            sections.append("Groq visual research was skipped because GROQ_API_KEY is not configured.")
 
         if visual_error:
             sections.append(visual_error)
@@ -1237,27 +1442,50 @@ class ArthurApp:
             self._conversation_stop.set()
             self._async_messages.put(("conversation_end", exit_kind))
             return
-        cleaned = self._normalise_arthur_command(transcript) if self.conversation_active else transcript
+        cleaned = self._normalise_arthur_command(transcript)
         if self.conversation_active and not cleaned:
-            self.speech.say("I'm listening, sir.")
+            self._say("I'm listening.")
             self._conversation_command_done.set()
             return
-        self.status_var.set("Understanding voice command…")
-        self._run_async("route", lambda: (cleaned or transcript, self.command_router.route(cleaned or transcript)))
 
-    def _dispatch_routed_command(self, transcript: str, routed):
+        command_text = cleaned or transcript
+        # Snapshot prior turns before adding the current utterance. Context stays local
+        # unless the user explicitly enables sharing with Groq in the .env file.
+        prior_context = self.conversation_context.render()
+        context_for_router = prior_context if self.share_conversation_context else ""
+        turn_id = self.conversation_context.begin_turn(command_text)
+        self.status_var.set("Understanding voice command…")
+        self._run_async(
+            "route",
+            lambda: (
+                command_text,
+                self.command_router.route(command_text, conversation_context=context_for_router),
+                turn_id,
+            ),
+        )
+
+    def _dispatch_routed_command(self, transcript: str, routed, *, turn_id: int | None = None):
         self._dispatch_context = (str(routed.action), str(transcript))
+        self._dispatch_turn_id = turn_id
         self.last_voice_transcript = str(transcript)
+        if turn_id is not None:
+            self.conversation_context.set_action(turn_id, str(routed.action), getattr(routed, "arguments", {}))
         try:
             return self._dispatch_routed_command_impl(transcript, routed)
         finally:
             self._dispatch_context = None
+            self._dispatch_turn_id = None
             if self.conversation_active:
                 self._conversation_command_done.set()
 
     def _dispatch_routed_command_impl(self, transcript: str, routed):
         action, argument = routed.action, routed.legacy_argument()
         args = routed.arguments
+
+        if action != "submit_typed_field":
+            # A new command invalidates the previous target. Only a successful new
+            # paste creates fresh context for a subsequent Enter/search command.
+            self._pending_field_context = None
 
         # Input and assistive controls are intentionally local-first; literal text never becomes code.
         if action == "keyboard_toggle":
@@ -1267,7 +1495,7 @@ class ArthurApp:
                 self.toggle_system_virtual_keyboard()
             else:
                 message = "The unified air virtual keyboard is already open." if should_open else "The unified air virtual keyboard is already closed."
-                self._set_output(message); self.speech.say(message)
+                self._set_output(message); self._say(message)
             return
         if action == "gesture_control":
             desired = bool(args.get("enabled", True))
@@ -1275,38 +1503,105 @@ class ArthurApp:
                 self.toggle_air_mouse()
             else:
                 message = "System-wide hand gestures are already enabled." if desired else "System-wide hand gestures are already disabled."
-                self._set_output(message); self.speech.say(message)
+                self._set_output(message); self._say(message)
             return
+        if action == "gesture_calibrate":
+            if not self.gesture_enabled or self.gesture_mouse is None:
+                message = "Hand tracking is not enabled yet. Say 'enable finger tracking' first, then calibrate it."
+                self._set_output(message); self._say(message)
+            else:
+                self.calibrate_gestures()
+            return
+        if action == "face_enroll":
+            self.enroll_face()
+            return
+        if action == "face_recognition":
+            desired = bool(args.get("enabled", True))
+            if desired != self.face_recognition_enabled:
+                self.face_var.set(desired)
+                self.toggle_face_recognition()
+            else:
+                message = "Face recognition is already enabled." if desired else "Face recognition is already disabled."
+                self._set_output(message); self._say(message)
+            return
+        if action == "submit_typed_field":
+            context = self._pending_field_context
+            if not context:
+                message = "I do not have a recent field to submit. First ask me to type into a supported field, or focus the field and ask me to type the exact text."
+                self._set_output(message); self._say(message)
+                return
+            if time.monotonic() - float(context.get("typed_at", 0.0)) > 120:
+                self._pending_field_context = None
+                message = "That typing target has expired. Repeat the typing command, then tell me to press Enter."
+                self._set_output(message); self._say(message)
+                return
+            target = str(context.get("target", ""))
+            element = str(context.get("element", ""))
+            title = str(context.get("target_title", "unknown window"))
+            normalized_target = target.casefold()
+            normalized_element = element.casefold()
+            requires_confirmation = field_submission_requires_confirmation(target, element)
+            if requires_confirmation:
+                warning = (
+                    "Enter may send a message or submit a form. Verify the visible recipient/destination and the entire text before proceeding."
+                    if normalized_target in {"gmail", "whatsapp", "whatsapp web"}
+                    else "Enter may submit the current form or trigger an application action. Verify the active window and text first."
+                )
+                approved = self._ask_yes_no(
+                    "Confirm Enter key", f"Arthur will press Enter in {title!r} ({target} {element}).\n\n{warning} Continue?",
+                    parent=self.root,
+                )
+                if not approved:
+                    self._say("Enter was not pressed. The text remains in the field.")
+                    return
+            self._pending_field_context = None
+            self.status_var.set("Submitting the remembered field…")
+            self._run_async(
+                "field_submit",
+                lambda: submit_typed_field(
+                    int(context.get("target_hwnd", 0)), title, target, element,
+                    context.get("focus_identity"),
+                ),
+            )
+            return
+
         if action == "type_text":
             literal = str(args.get("text", ""))
             if not literal:
-                self.speech.say("Tell me the exact text you want typed.")
+                self._say("Tell me the exact text you want typed.")
                 return
+            target_hwnd, target_title = capture_foreground_window()
             preview = literal if len(literal) <= 1200 else literal[:1200] + "…"
-            confirm_text = ("Paste this exact text into a Windows text field? It will not be submitted or sent.\n\n"
-                           "After selecting Yes, switch to the intended application and click its target field within four seconds.\n\n" + preview)
+            confirm_text = (
+                "Paste this exact text into the window that was focused when you made the request? "
+                "Arthur will restore that window after this confirmation and will not submit or send the text.\n\n"
+                f"Target window: {target_title or 'not detected'}\n\n{preview}"
+            )
             if self._ask_yes_no("Type literal text?", confirm_text, parent=self.root):
-                self.status_var.set("Typing in four seconds — select the target application and field now.")
-                self.speech.say("Switch to the target application and click the field within four seconds.")
-                self._run_async("typed_text", lambda: self._paste_after_focus_delay(literal, 4.0))
+                self.status_var.set("Pasting into the captured foreground window…")
+                def _paste_current_field():
+                    message = type_text_to_focused_window(literal, target_hwnd)
+                    return {"message": message, "target_hwnd": target_hwnd, "target_title": target_title,
+                            "target": "foreground application", "element": "text field",
+                            "focus_identity": capture_focused_control_identity()}
+                self._run_async("typed_text", _paste_current_field)
             else:
-                self.speech.say("Typing cancelled. Nothing was entered.")
+                self._say("Typing cancelled. Nothing was entered.")
             return
         if action == "draft_and_type":
+            self._pending_type_target = capture_foreground_window()
             prompt = str(args.get("prompt", transcript)).strip()
             if not self.gemini.available():
-                message = "Draft generation requires GEMINI_API_KEY in your local .env file. No text was entered."
-                self._set_output(message); self.speech.say(message)
+                message = "Draft generation requires GROQ_API_KEY in your local .env file. No text was entered."
+                self._set_output(message); self._say(message)
                 return
             generic = bool(re.search(r"\b(?:an?\s+)?(?:email|message|reply|note|paragraph)\b", prompt, re.I)) and not bool(re.search(r"\b(?:about|regarding|because|request(?:ing)?|ask(?:ing)?|tell(?:ing)?|thank(?:ing)?|apolog(?:y|ize|ise)|say(?:ing)?|that)\b", prompt, re.I))
             if generic:
                 details = simpledialog.askstring("Draft details", "What should the email/message say? Enter the important context; Arthur will not invent personal facts.", parent=self.root)
                 if not details or not details.strip():
-                    self.speech.say("Draft cancelled because no message details were provided.")
+                    self._say("Draft cancelled because no message details were provided.")
                     return
                 prompt += "\nUser-provided content/details: " + details.strip()
-            if not self._ask_yes_no("Draft with Gemini?", "Send this text instruction to Gemini to generate a draft? No camera image will be attached. The generated draft will be shown for review and will not be sent automatically.", parent=self.root):
-                return
             full_prompt = ("Create a polished, editable draft from this instruction. Do not invent names, dates, reasons, commitments, or other personal facts. "
                            "Where an essential fact is missing, use a clearly marked short placeholder instead. Return only the draft text, no commentary.\n\n" + prompt)
             self._run_async("draft_text", lambda: self.gemini.ask_text(full_prompt, use_web_search=False))
@@ -1315,18 +1610,18 @@ class ArthurApp:
             target = str(args.get("target", "")); element = str(args.get("element", ""))
             try:
                 response = focus_application_target(target, element)
-                self._set_output(response); self.speech.say(response)
+                self._set_output(response); self._say(response)
             except Exception as exc:
                 self._set_output(f"Could not focus the requested target safely: {exc}")
-                self.speech.say("I could not verify that control. Please select the field manually before typing.")
+                self._say("I could not verify that control. Please select the field manually before typing.")
             return
         if action == "calculate_expression":
             try:
                 expression, result = calculate_expression(str(args.get("expression", "")))
                 response = f"The calculation is {expression} = {result}. This result was computed locally using a restricted arithmetic parser."
-                self._set_output(response); self.speech.say(response)
+                self._set_output(response); self._say(response)
             except Exception as exc:
-                self._set_output(f"Calculation failed: {exc}"); self.speech.say("I could not safely calculate that expression.")
+                self._set_output(f"Calculation failed: {exc}"); self._say("I could not safely calculate that expression.")
             return
         if action == "calculator_calculate":
             expression = str(args.get("expression", ""))
@@ -1339,7 +1634,7 @@ class ArthurApp:
             else:
                 record = self.action_history.last()
                 response = (f"The last recorded action was: {record.get('transcript') or record.get('action')}. Result: {record.get('result')}" if record else "I don't have a completed action result recorded yet.")
-            self._set_output(response); self.speech.say(response[:3500])
+            self._set_output(response); self._say(response[:3500])
             return
         if action == "profile_preference_set":
             value = str(args.get("value", "")).strip()
@@ -1349,17 +1644,28 @@ class ArthurApp:
                 people = self.face_memory.list_people()
                 if not people:
                     message = "No enrolled face profile is available for a persistent preference. Enroll the consenting user first, then repeat the preference command."
-                    self._set_output(message); self.speech.say(message)
+                    self._set_output(message); self._say(message)
                     return
-                selected = simpledialog.askstring("Profile preference", "Which enrolled profile should this preference apply to? Enter an exact name:\n\n" + "\n".join(people), parent=self.root)
-                profile_name = next((name for name in people if selected and name.casefold() == selected.strip().casefold()), None)
+                if len(people) == 1:
+                    # A sole enrolled profile is an unambiguous target; avoid interrupting
+                    # the live voice conversation with a modal text-entry dialog.
+                    profile_name = people[0]
+                else:
+                    profile_prompt = "Which enrolled profile should this preference apply to? Say its exact enrolled name. " + ", ".join(people)
+                    selected = self._ask_voice_text(profile_prompt) if self.conversation_active else simpledialog.askstring(
+                        "Profile preference", "Which enrolled profile should this preference apply to? Enter an exact name:\n\n" + "\n".join(people), parent=self.root
+                    )
+                    profile_name = next((name for name in people if selected and name.casefold() == selected.strip().casefold()), None)
             slug = self.face_memory.profile_slug(profile_name) if profile_name else None
             if not slug or not value:
                 message = "Preference not saved. Choose an exact enrolled profile and provide a non-empty preference."
             else:
                 self.action_history.set_preference(slug, key, value)
-                message = f"Saved the preference for enrolled profile {profile_name}: preferred form of address is {value}. It is stored locally and will persist across restarts."
-            self._set_output(message); self.speech.say(message)
+                self._activate_face_profile(profile_name)
+                if key.casefold() == "preferred_name":
+                    self.active_preferred_name = normalize_preferred_name(value)
+                message = f"Saved your preferred form of address as {value}. It is active immediately and stored locally for the enrolled profile {profile_name}."
+            self._set_output(message); self._say(message)
             return
         if action == "weather_lookup":
             location = str(args.get("location", "")).strip() or os.getenv("VISIONGUIDE_DEFAULT_LOCATION", "").strip()
@@ -1371,7 +1677,7 @@ class ArthurApp:
                     return
                 location = simpledialog.askstring("Weather location", "Enter a city, place, address, or 'latitude, longitude':", parent=self.root) or ""
             if not location:
-                self.speech.say("Weather lookup cancelled because no location was supplied.")
+                self._say("Weather lookup cancelled because no location was supplied.")
                 return
             self._run_async("weather", lambda: self.maps_services.format_weather(location))
             return
@@ -1382,7 +1688,7 @@ class ArthurApp:
             if not destination:
                 destination = simpledialog.askstring("Navigation destination", "Where would you like to go?", parent=self.root) or ""
             if not destination:
-                self.speech.say("Navigation cancelled because no destination was supplied.")
+                self._say("Navigation cancelled because no destination was supplied.")
                 return
             start_live = self._ask_yes_no("Live navigation", "Start live turn-by-turn guidance? This uses Windows device location (if available), speaks route steps, and may request another route if you go off route. Location is used for navigation, not saved as a profile.")
             if start_live and origin:
@@ -1397,16 +1703,34 @@ class ArthurApp:
                 if self.navigation_session and self.navigation_session.running:
                     messagebox.showinfo("Navigation already active", "Stop the current navigation before starting another route.")
                     return
-                self.navigation_session = NavigationSession(
+                session = NavigationSession(
                     self.maps_services, destination, mode,
                     on_update=lambda update: self._async_messages.put(("navigation_update", update)),
                 )
-                self._run_async("navigation_start", lambda: self.navigation_session.start())
+                self.navigation_session = session
+                def start_live_navigation():
+                    try:
+                        return session.start()
+                    except Exception as exc:
+                        if origin:
+                            self.maps_services.open_route_in_maps(origin, destination, mode)
+                            if self.navigation_session is session:
+                                self.navigation_session = None
+                            return (
+                                f"Live navigation could not start: {exc}. I opened Google Maps with a static "
+                                f"route from {origin} to {destination}. Live location and spoken rerouting are not active."
+                            )
+                        raise RuntimeError(
+                            f"Live navigation could not start: {exc}. Enable Windows Location access, "
+                            "check the Maps Routes API key and billing, or provide an explicit starting place "
+                            "and choose static directions."
+                        ) from exc
+                self._run_async("navigation_start", start_live_navigation)
             else:
                 if not origin:
                     origin = simpledialog.askstring("Route origin", "Enter the starting place or address:", parent=self.root) or ""
                 if not origin:
-                    self.speech.say("Route lookup cancelled because no origin was supplied.")
+                    self._say("Route lookup cancelled because no origin was supplied.")
                     return
                 self._run_async("route_calculation", lambda: self._calculate_and_open_route(origin, destination, mode))
             return
@@ -1417,15 +1741,15 @@ class ArthurApp:
                 self._set_output("Stopping live navigation.")
             else:
                 message = "No live navigation session is active."
-                self._set_output(message); self.speech.say(message)
+                self._set_output(message); self._say(message)
             return
         if action == "product_lookup":
             frame = self._require_frame()
             if frame is None:
                 return
             query = str(args.get("query", "Tell me about the visible product or object.")).strip()
-            if not self._ask_yes_no("Research the visible item?", "Arthur will send a compressed camera image to the configured Gemini service and, when a Google Cloud API key is available, Google Cloud Vision Web Detection to look for related public pages and visually similar images. The image may contain people or private information. Continue?"):
-                self.speech.say("Visual product research cancelled; the image was not uploaded by this action.")
+            if not self._ask_yes_no("Research the visible item?", "Arthur will send a compressed camera image to the configured Groq service and, when a Google Cloud API key is available, Google Cloud Vision Web Detection to look for related public pages and visually similar images. The image may contain people or private information. Continue?"):
+                self._say("Visual product research cancelled; the image was not uploaded by this action.")
                 return
             self._run_async("product_lookup", lambda: self._research_visible_item(frame, query))
             return
@@ -1439,7 +1763,7 @@ class ArthurApp:
                     if operation in GOOGLE_WORKSPACE_WRITE_OPERATIONS:
                         preview = "\n".join(f"{key}: {str(value)[:1000]}" for key, value in args.items() if key != "operation")
                         if not self._ask_yes_no("Confirm Google Workspace change", f"Arthur will perform '{operation}' in your Google account. Review the details below. This action cannot be automatically undone. Continue?\n\n{preview}", parent=self.root):
-                            self.speech.say("Google Workspace change cancelled.")
+                            self._say("Google Workspace change cancelled.")
                             return
                     self._run_async("workspace", lambda: execute_google_workspace_operation(operation, args, confirmed=operation in GOOGLE_WORKSPACE_WRITE_OPERATIONS))
                     return
@@ -1451,71 +1775,78 @@ class ArthurApp:
                 from visionguide.integrations.google_cloud_services import execute_google_cloud_operation
                 operation = str(args.get("operation", "")).casefold()
                 if not self._ask_yes_no("Send text to Google Cloud?", f"The requested {operation} action sends the supplied text to Google's Cloud API for processing. It is not saved by this local integration. Do not submit passwords or other unnecessary sensitive information. Continue?\n\n{str(args.get('text', ''))[:1000]}", parent=self.root):
-                    self.speech.say("Google Cloud text operation cancelled.")
+                    self._say("Google Cloud text operation cancelled.")
                     return
                 self._run_async("workspace", lambda: execute_google_cloud_operation(operation, args))
             except Exception as exc:
                 messagebox.showerror("Google API integration", str(exc), parent=self.root)
-                self.speech.say("The Google API request failed. Check the displayed error.")
+                self._say("The Google API request failed. Check the displayed error.")
+            return
+
+        if action == "youtube_select_result":
+            index = int(args.get("index", 1))
+            self.status_var.set(f"Finding YouTube result {index}…")
+            self._run_async("youtube_select_result", lambda: play_youtube_result(index))
             return
 
         # These integrations execute through typed, permission-aware device/provider adapters.
         if action in {"media_playback", "brightness_set", "brightness_adjust", "volume_set", "volume_adjust", "audio_mute", "wifi_set", "wifi_status", "brightness_get", "volume_get",
                       "timer_set", "timer_list", "timer_cancel", "gmail_unread", "gmail_search", "calendar_upcoming", "calendar_search",
-                      "calendar_create_event", "gmail_compose", "gmail_send_current", "gmail_read_message", "word_write", "whatsapp_compose",
+                      "calendar_create_event", "gmail_compose", "gmail_send_current", "gmail_read_message", "word_write",
+                      "word_save_document", "word_replace_text", "word_delete_selection", "whatsapp_compose",
                       "whatsapp_send_current", "type_into_window"}:
             try:
                 if action == "media_playback":
                     response = media_playback(str(args.get("action", "toggle")), int(args.get("seconds", 10)))
-                    self._set_output(response); self.speech.say(response)
+                    self._set_output(response); self._say(response)
                 elif action == "brightness_set":
                     response = set_brightness(int(args["level"]))
-                    self._set_output(response); self.speech.say(response)
+                    self._set_output(response); self._say(response)
                 elif action == "brightness_adjust":
                     response = adjust_brightness(int(args["delta"]))
-                    self._set_output(response); self.speech.say(response)
+                    self._set_output(response); self._say(response)
                 elif action == "volume_set":
                     response = set_volume(int(args["level"]))
-                    self._set_output(response); self.speech.say(response)
+                    self._set_output(response); self._say(response)
                 elif action == "volume_adjust":
                     response = adjust_volume(int(args["delta"]))
-                    self._set_output(response); self.speech.say(response)
+                    self._set_output(response); self._say(response)
                 elif action == "audio_mute":
                     response = set_mute(bool(args.get("muted", True)))
-                    self._set_output(response); self.speech.say(response)
+                    self._set_output(response); self._say(response)
                 elif action == "brightness_get":
                     response = f"Current display brightness is approximately {get_brightness()} percent."
-                    self._set_output(response); self.speech.say(response)
+                    self._set_output(response); self._say(response)
                 elif action == "volume_get":
                     state = get_volume()
                     response = f"System volume is {state['volume']} percent and audio is {'muted' if state['muted'] else 'unmuted'}."
-                    self._set_output(response); self.speech.say(response)
+                    self._set_output(response); self._say(response)
                 elif action == "wifi_status":
                     adapters = list_wifi_adapters()
                     response = "Network adapters: " + ("; ".join(f"{x['name']}: {x['admin_state']}, {x['state']}" for x in adapters) or "none detected")
-                    self._set_output(response); self.speech.say(response[:1500])
+                    self._set_output(response); self._say(response[:1500])
                 elif action == "wifi_set":
                     enabled = bool(args.get("enabled"))
                     adapter = str(args.get("adapter", "Wi-Fi"))
                     operation = "enable" if enabled else "disable"
                     if self._ask_yes_no("Change Wi-Fi state?", f"This will {operation} the network adapter {adapter!r}. This may disconnect Arthur and active work. Continue?"):
                         response = set_wifi(enabled, adapter)
-                        self._set_output(response); self.speech.say(response)
+                        self._set_output(response); self._say(response)
                     else:
-                        self.speech.say("Wi-Fi change cancelled.")
+                        self._say("Wi-Fi change cancelled.")
                 elif action == "timer_set":
                     record = self.timer_manager.schedule(int(args.get("seconds", 0)), str(args.get("label", "Reminder")))
                     response = f"Timer {record.timer_id} set for {record.duration_seconds} seconds: {record.label}."
-                    self._set_output(response); self.speech.say(response)
+                    self._set_output(response); self._say(response)
                 elif action == "timer_list":
                     rows = self.timer_manager.list_timers()
                     response = "No active timers." if not rows else "Active timers: " + "; ".join(f"{r['id']}: {r['label']}, {r['remaining_seconds']} seconds remaining" for r in rows)
-                    self._set_output(response); self.speech.say(response)
+                    self._set_output(response); self._say(response)
                 elif action == "timer_cancel":
                     timer_id = int(args.get("id", 0))
                     cancelled = self.timer_manager.cancel(timer_id)
                     response = f"Timer {timer_id} cancelled." if cancelled else f"No active timer with ID {timer_id}."
-                    self._set_output(response); self.speech.say(response)
+                    self._set_output(response); self._say(response)
                 elif action == "gmail_unread":
                     limit = int(args.get("limit", 10)); include_body = bool(args.get("include_body", False))
                     self._run_async("workspace", lambda: {"kind": "gmail_unread", "include_body": include_body, "messages": gmail_unread(limit, include_body=include_body)})
@@ -1539,11 +1870,11 @@ class ArthurApp:
                     if self._ask_yes_no("Add Google Calendar event?", "Review and confirm this event.\n\n" + preview):
                         self._run_async("workspace", lambda: {"kind": "calendar_create_event", "event": calendar_create_event(summary, start, end, tz, location=str(args.get("location", "")), description=str(args.get("description", "")), confirmed=True)})
                     else:
-                        self.speech.say("Calendar event cancelled.")
+                        self._say("Calendar event cancelled.")
                 elif action == "gmail_compose":
                     recipient = str(args.get("recipient", "")); subject = str(args.get("subject", "")); instructions = str(args.get("instructions", ""))
-                    if not self._ask_yes_no("Prepare Gmail draft?", f"Arthur will send these drafting instructions to Gemini as text, then enter a draft into your Gmail window.\n\nTo: {recipient}\nSubject: {subject}\nInstructions: {instructions}\n\nNo email will be sent by this step. Continue?"):
-                        self.speech.say("Email draft cancelled.")
+                    if not self._ask_yes_no("Prepare Gmail draft?", f"Arthur will send these drafting instructions to Groq as text, then enter a draft into your Gmail window.\n\nTo: {recipient}\nSubject: {subject}\nInstructions: {instructions}\n\nNo email will be sent by this step. Continue?"):
+                        self._say("Email draft cancelled.")
                     else:
                         def prepare_gmail_draft():
                             body = self.gemini.ask_text("Write only the body of a professional email. Do not invent factual details. User instructions: " + instructions)
@@ -1559,31 +1890,70 @@ class ArthurApp:
                             return {"kind": "gmail_send_current", "message": f"Issued Ctrl+Enter in {title!r}. Verify Gmail's Sent state to confirm delivery."}
                         self._run_async("workspace", send_current)
                     else:
-                        self.speech.say("Email send cancelled. The draft remains open.")
+                        self._say("Email send cancelled. The draft remains open.")
                 elif action == "word_write":
                     text_to_write = str(args.get("text", ""))
                     if not self._ask_yes_no("Create Word document?", "Arthur will open Microsoft Word, create a new document, and paste this text. It will not save or share the document. Continue?\n\n" + text_to_write[:1200]):
-                        self.speech.say("Word document creation cancelled.")
+                        self._say("Word document creation cancelled.")
                     else:
                         self._run_async("workspace", lambda: {"kind": "word_write", "message": word_write_document(text_to_write)})
+                elif action == "word_save_document":
+                    file_name = str(args.get("file_name", "") or "").strip()
+                    target = f"Documents/ARTHUR/{file_name}" if file_name else "the current Word filename, or a timestamped file in Documents/ARTHUR if the document has not been saved before"
+                    if self._ask_yes_no("Save Word document?", f"Arthur will save the currently active Microsoft Word document to {target}. Existing files will not be overwritten. Continue?", parent=self.root):
+                        self._run_async("workspace", lambda: {"kind": "word_save_document", "message": save_active_word_document(file_name)})
+                    else:
+                        self._say("Word save cancelled. The document remains open and unchanged.")
+                elif action == "word_replace_text":
+                    find_text = str(args.get("find_text", ""))
+                    replace_text = str(args.get("replace_text", ""))
+                    if not find_text:
+                        self._say("Tell me the exact text to find in the Word document.")
+                    elif self._ask_yes_no("Update Word document?", f"Replace every occurrence of this text in the active Word document?\n\nFind: {find_text[:500]}\nReplace with: {replace_text[:500]}\n\nThe document will be modified but not saved.", parent=self.root):
+                        self._run_async("workspace", lambda: {"kind": "word_replace_text", "message": replace_text_in_active_word_document(find_text, replace_text, confirmed=True)})
+                    else:
+                        self._say("Word document update cancelled.")
+                elif action == "word_delete_selection":
+                    selected_text = get_active_word_selection_text()
+                    if not selected_text.strip():
+                        self._say("There is no selected text in the active Word document.")
+                    elif self._ask_yes_no("Delete selected Word text?", f"Arthur will delete only this selected text from the active Word document. The document will be modified but not saved.\n\n{selected_text[:1000]}", parent=self.root):
+                        self._run_async("workspace", lambda: {"kind": "word_delete_selection", "message": delete_active_word_selection(selected_text, confirmed=True)})
+                    else:
+                        self._say("Word text deletion cancelled.")
                 elif action == "whatsapp_compose":
                     contact, body = str(args.get("contact", "")), str(args.get("message", ""))
                     if not self._ask_yes_no("Prepare WhatsApp message?", f"Arthur will open WhatsApp Web and enter a draft. It will NOT send it. Verify the selected contact in WhatsApp before sending.\n\nContact: {contact}\nMessage: {body[:1500]}\n\nContinue?"):
-                        self.speech.say("WhatsApp draft cancelled.")
+                        self._say("WhatsApp draft cancelled.")
                     else:
                         self._run_async("workspace", lambda: {"kind": "whatsapp_compose", "contact": contact, "message_preview": body[:1200], "message": compose_whatsapp_gui(contact, body, send=False)})
                 elif action == "whatsapp_send_current":
                     if self._ask_yes_no("Confirm WhatsApp send", "Confirm that the visible WhatsApp chat title matches the intended contact and the complete message is correct. Arthur will press Enter to send the current message. Continue?"):
                         self._run_async("workspace", lambda: {"kind": "whatsapp_send_current", "message": send_current_whatsapp(confirmed_send=True)})
                     else:
-                        self.speech.say("WhatsApp send cancelled. The draft remains unsent.")
+                        self._say("WhatsApp send cancelled. The draft remains unsent.")
                 elif action == "type_into_window":
-                    target, text_to_type = str(args.get("target", "")), str(args.get("text", ""))
-                    if self._ask_yes_no("Paste dictated text?", f"Paste text into the {target} window without submitting it? Review the destination first.\n\n{text_to_type[:1000]}"):
-                        self._run_async("workspace", lambda: {"kind": "type_into_window", "message": type_into_window(target, text_to_type)})
+                    target = str(args.get("target", ""))
+                    element = str(args.get("element", ""))
+                    text_to_type = str(args.get("text", ""))
+                    destination = f"{target} {element}".strip()
+                    if element.casefold() in {"search box", "search bar", "search field", "address bar", "url bar"}:
+                        field_plan = f"use the supported keyboard shortcut for the {element}"
+                    elif target.casefold() in {"word", "microsoft word"}:
+                        field_plan = "insert at the current Microsoft Word document cursor/selection"
+                    else:
+                        field_plan = f"activate {target} and paste into its currently focused control/selection. For an arbitrary text box or webpage field, click that field first; Arthur cannot reliably identify every custom control from a window title alone"
+                    if self._ask_yes_no("Paste dictated text?", f"Arthur will {field_plan}. The text will not be submitted or sent by this step.\n\n{text_to_type[:1000]}"):
+                        def _paste_targeted_field():
+                            message = type_into_window(target, text_to_type, element)
+                            target_hwnd, target_title = capture_foreground_window()
+                            return {"message": message, "target_hwnd": target_hwnd, "target_title": target_title,
+                                    "target": target, "element": element or "text field",
+                                    "focus_identity": capture_focused_control_identity()}
+                        self._run_async("type_into_window", _paste_targeted_field)
             except Exception as exc:
                 messagebox.showerror("Arthur integration", str(exc))
-                self.speech.say("That integration action failed. Please check the displayed error.")
+                self._say("That integration action failed. Please check the displayed error.")
             return
 
         if action == "general_query":
@@ -1602,15 +1972,15 @@ class ArthurApp:
             else:
                 response = f"I did not detect a {argument} in the current camera view. That does not prove it is absent; it may be outside the frame or missed by the detector."
             self._set_output(response)
-            self.speech.say(response)
+            self._say(response)
         elif action == "safety_on":
             self.safety_var.set(True)
             self.toggle_safety()
-            self.speech.say("Safety alerts enabled." if self.safety_enabled else "Safety alerts remain off because metric depth is not ready.")
+            self._say("Safety alerts enabled." if self.safety_enabled else "Safety alerts remain off because metric depth is not ready.")
         elif action == "safety_off":
             self.safety_var.set(False)
             self.toggle_safety()
-            self.speech.say("Safety alerts disabled.")
+            self._say("Safety alerts disabled.")
         elif action == "snapshot":
             self.save_snapshot()
         elif action == "screenshot":
@@ -1618,16 +1988,16 @@ class ArthurApp:
                 path = capture_screen(self.data_dir / "snapshots")
                 message = f"Screenshot saved locally to {path}. It has not been uploaded. Say 'explain what is on my screen' to request an AI description."
                 self._set_output(message)
-                self.speech.say(message)
+                self._say(message)
             except Exception as exc:
                 messagebox.showerror("Screenshot failed", str(exc))
         elif action == "screen_describe":
             try:
                 path = capture_screen(self.data_dir / "snapshots")
-                if not self._ask_yes_no("Share screenshot with AI?", "To describe your screen, Arthur will send this screenshot to the configured Gemini service. It may contain private information. Continue?"):
+                if not self._ask_yes_no("Share screenshot with AI?", "To describe your screen, Arthur will send this screenshot to the configured Groq service. It may contain private information. Continue?"):
                     message = f"Screenshot saved locally to {path}; AI upload cancelled."
                     self._set_output(message)
-                    self.speech.say(message)
+                    self._say(message)
                 else:
                     frame = image_file_to_bgr(path)
                     prompt = argument or "Describe the visible screen. Read prominent text and controls where possible, explain visible error messages if any, and distinguish observation from inference. Do not infer unseen content."
@@ -1643,7 +2013,7 @@ class ArthurApp:
                 self._run_async("screen_ocr", lambda: read_document(frame))
             except Exception as exc:
                 messagebox.showerror("Read screen failed", str(exc))
-        elif action in {"youtube_search", "web_search", "open_website", "open_app", "open_folder", "open_latest_pdf"}:
+        elif action in {"youtube_search", "web_search", "open_website", "open_app", "close_app", "close_website", "open_folder", "open_latest_pdf"}:
             try:
                 if action == "youtube_search":
                     response = search_youtube(argument)
@@ -1653,15 +2023,35 @@ class ArthurApp:
                     response = open_website(argument)
                 elif action == "open_app":
                     response = open_app(argument)
+                elif action == "close_app":
+                    target_name = str(args.get("name", argument)).strip()
+                    if not self._ask_yes_no(
+                        "Close application window?",
+                        f"Arthur will send a normal close request to the {target_name} desktop application. Unsaved work may trigger a save prompt. Continue?",
+                        parent=self.root,
+                    ):
+                        response = f"Closing {target_name} was cancelled."
+                    else:
+                        response = close_application(target_name)
+                elif action == "close_website":
+                    target_name = str(args.get("name", argument)).strip()
+                    if not self._ask_yes_no(
+                        "Close website tab?",
+                        f"Arthur will close the currently active browser tab for {target_name}. The browser itself will remain open unless that was its last tab. Continue?",
+                        parent=self.root,
+                    ):
+                        response = f"Closing the {target_name} tab was cancelled."
+                    else:
+                        response = close_website_tab(target_name)
                 elif action == "open_folder":
                     response = open_folder(argument, self.project_dir)
                 else:
                     response = open_document(find_latest_pdf())
                 self._set_output(response)
-                self.speech.say(response)
+                self._say(natural_action_response(action, args, response))
             except Exception as exc:
                 messagebox.showerror("Desktop action failed", str(exc))
-                self.speech.say("The requested desktop action could not be completed. Please check the message on screen.")
+                self._say("The requested desktop action could not be completed. Please check the message on screen.")
         elif action == "open_document":
             chosen = filedialog.askopenfilename(parent=self.root, title="Choose a document to open",
                 filetypes=[("Supported documents", "*.txt *.md *.pdf *.docx *.py *.js *.ts *.tsx *.java *.c *.cpp *.csv *.json *.html *.css *.log"), ("All files", "*.*")])
@@ -1669,7 +2059,7 @@ class ArthurApp:
                 try:
                     response = open_document(Path(chosen))
                     self._set_output(response)
-                    self.speech.say(response)
+                    self._say(response)
                 except Exception as exc:
                     messagebox.showerror("Open document failed", str(exc))
         elif action == "document_search":
@@ -1683,32 +2073,32 @@ class ArthurApp:
                     else:
                         response = f"Found '{argument}' in {Path(chosen).name}, {len(matches)} match(es) shown:\n" + "\n".join(f"{m.location}: {m.excerpt}" for m in matches)
                     self._set_output(response)
-                    self.speech.say(response[:4500])
+                    self._say(response[:4500])
                 except Exception as exc:
                     messagebox.showerror("Document search failed", str(exc))
         elif action == "internet_status":
             response = check_internet_connectivity()
             self._set_output(response)
-            self.speech.say(response)
+            self._say(response)
         elif action == "system_status":
             try:
                 response = system_status()
                 self._set_output(response)
-                self.speech.say(response)
+                self._say(response)
             except Exception as exc:
                 messagebox.showerror("System status failed", str(exc))
         elif action == "find_word":
             if not self.latest_ocr:
-                self.speech.say("Scan a page before searching for a word.")
+                self._say("Scan a page before searching for a word.")
             else:
                 matches = find_word(self.latest_ocr, argument)
                 response = (f"Found {argument} on lines " + ", ".join(str(n) for n, _ in matches[:10])) if matches else f"I did not find {argument} on the last scanned page."
                 self._set_output(response)
-                self.speech.say(response)
+                self._say(response)
         elif action == "ask_ai":
             if argument:
                 frame = self._require_frame()
-                if frame is not None and self._ask_yes_no("Send image to Gemini?", "This voice command sends the current camera image and question to Gemini. Proceed?"):
+                if frame is not None and self._ask_yes_no("Send image to Groq?", "This voice command sends the current camera image and question to Groq. Proceed?"):
                     self._run_async("gemini", lambda: self.gemini.ask_about_frame(argument, frame, False))
         elif action == "text_ai":
             self._submit_voice_text_ai(argument or transcript)
@@ -1718,7 +2108,7 @@ class ArthurApp:
                     memory_id = self.memory.add(argument)
                     message = f"Saved memory {memory_id} locally."
                     self._append_output(message)
-                    self.speech.say(message)
+                    self._say(message)
                 except Exception as exc:
                     messagebox.showerror("Memory save failed", str(exc))
         elif action == "memory_search":
@@ -1728,28 +2118,28 @@ class ArthurApp:
             else:
                 message = "Here is what I remember locally: " + "; ".join(str(row["content"]) for row in rows[:10])
             self._set_output(message)
-            self.speech.say(message[:5000])
+            self._say(message[:5000], address_user=False)
         elif action == "memory_delete":
             if not argument:
                 message = "Please give me a phrase from the memory you want deleted."
                 self._append_output(message)
-                self.speech.say(message)
+                self._say(message)
             else:
                 rows = self.memory.search(argument, limit=100)
                 if not rows:
                     message = "No matching local memories were found."
                     self._append_output(message)
-                    self.speech.say(message)
+                    self._say(message)
                 elif self._ask_yes_no("Delete local memories?", f"Permanently delete {len(rows)} matching local memory entr(y/ies)?"):
                     deleted = self.memory.delete_matching(argument)
                     message = f"Deleted {deleted} local memory entr(y/ies)."
                     self._append_output(message)
-                    self.speech.say(message)
+                    self._say(message)
         elif action == "email_send":
             response = ("Sending email is not enabled in this build: no authenticated email-provider integration is configured. "
                         "I can draft an email with 'write an email to ...', but you must review and send it through your email client.")
             self._set_output(response)
-            self.speech.say(response)
+            self._say(response)
             messagebox.showinfo("Email not sent", response)
         elif action == "wake_on":
             self.toggle_wake_word(enable=True)
@@ -1763,33 +2153,34 @@ class ArthurApp:
             if self.sign_enabled:
                 self._stop_sign_mode()
                 self._append_output("Isolated-sign recognition stopped.")
-                self.speech.say("Sign recognition stopped.")
+                self._say("Sign recognition stopped.")
             else:
-                self.speech.say("Sign recognition is not active.")
+                self._say("Sign recognition is not active.")
         elif action == "cancel":
-            self.speech.say("There is no cancellable action currently running. Use Exit or turn off the active feature to stop it.")
+            self._say("There is no cancellable action currently running. Use Exit or turn off the active feature to stop it.")
         elif action == "camera_stop":
             self._camera_explicitly_enabled = False
             self.worker.stop()
             self.latest_frame = None
             self.latest_detections = []
-            self.speech.say("Camera off, sir.")
+            self._say("Camera off, sir.")
             self._append_output("Camera capture stopped by user request.")
         elif action == "camera_start":
             self._camera_explicitly_enabled = True
-            self.worker.start()
-            message = "Camera is on, sir. It will stay on until you ask me to turn it off."
+            try:
+                self.worker.start()
+                message = "Starting the camera and vision model. I will confirm when frames are available; if a model or permission is missing, I will report the exact error."
+            except Exception as exc:
+                self._camera_explicitly_enabled = False
+                message = f"I could not start the camera: {exc}"
             self._append_output(message)
-            self.speech.say(message)
+            self._say(message)
         elif action == "help":
             self.show_help()
         else:
-            if self._ask_yes_no("Ask text-only AI?", "I did not recognize this as a local command. Send the transcribed words to Gemini as a text-only request? No camera or screen image will be sent."):
-                self._submit_voice_text_ai(transcript)
-            else:
-                message = "Command cancelled. Open Help / controls or COMMAND_CATALOGUE.md to see the supported commands."
-                self._append_output(message)
-                self.speech.say(message)
+            # Unknown/non-local voice requests are conversational input by default.
+            # No confirmation dialog or "local command not found" narration is shown.
+            self._submit_voice_text_ai(transcript)
 
     @staticmethod
     def _format_workspace_result(result) -> str:
@@ -1858,8 +2249,18 @@ class ArthurApp:
             return "Google Workspace request completed."
         if kind == "gmail_compose":
             return (f"{result.get('message', 'Gmail draft prepared.')}\n\nTo: {result.get('recipient', '')}\nSubject: {result.get('subject', '')}\n\nDraft body preview:\n{result.get('body_preview', '')}\n\nReview the complete draft in Gmail before saying 'send email'.")
-        if kind in {"gmail_send_current", "whatsapp_send_current", "word_write", "type_into_window"}:
+        if kind in {"gmail_send_current", "whatsapp_send_current", "word_write", "word_save_document", "word_replace_text", "word_delete_selection", "type_into_window"}:
             return str(result.get("message", "The GUI action has completed. Inspect the target window to verify the result."))
+        if kind == "docs_delete_range":
+            area = result.get("deleted_range", {}) or {}
+            return f"Deleted the confirmed content range {area.get('start_index', '')}–{area.get('end_index', '')} from Google Doc {result.get('document_id', '')}. Google Docs saves the change automatically."
+        if kind == "drive_file_update":
+            file_info = result.get("file", {}) or {}
+            return f"Updated Google Drive file {file_info.get('name') or file_info.get('id', '')}."
+        if kind == "drive_file_delete":
+            return f"Deleted Google Drive file {result.get('deleted_file_id', '')}."
+        if kind in {"docs_insert_text", "docs_replace_text", "docs_batch_update"}:
+            return f"Updated Google Doc {result.get('document_id', '')}. Google Docs saves API changes automatically."
         if kind == "whatsapp_compose":
             return (f"{result.get('message', 'WhatsApp message prepared.')}\n\nContact requested: {result.get('contact', '')}\nMessage preview: {result.get('message_preview', '')}\n\nVerify the visible chat title and text before saying 'send WhatsApp message'.")
         return str(result)
@@ -1936,7 +2337,7 @@ class ArthurApp:
         self._conversation_command_done.set()
         self.status_var.set("Arthur is active · 30-second inactivity timeout")
         self._append_output("Wake phrase detected. Continuous conversation is active.")
-        self.speech.say("Yes, sir?")
+        self._say("Yes, sir?")
         self._run_async("conversation_loop", self._conversation_loop)
 
     def _conversation_loop(self):
@@ -1949,7 +2350,7 @@ class ArthurApp:
                 self._async_messages.put(("conversation_end", "timeout"))
                 return "timeout"
             try:
-                transcript = record_and_transcribe(duration_seconds=5.0, model_name="base", stop_event=self._conversation_stop)
+                transcript = record_and_transcribe(duration_seconds=10.0, model_name="base", stop_event=self._conversation_stop)
             except Exception as exc:
                 self._async_messages.put(("conversation_error", str(exc)))
                 return "error"
@@ -1989,25 +2390,54 @@ class ArthurApp:
                 self.listening_button.configure(text="Listening: OFF")
                 self.wake_word_listener = None
                 self._append_output("Wake-word listener could not restart: " + str(exc))
-                self.speech.say("Listening stopped because the wake-word detector could not restart.")
+                self._say("Listening stopped because the wake-word detector could not restart.")
 
     def show_help(self):
-        messagebox.showinfo("Arthur controls",
-            "The camera starts silently. Nothing is spoken unless you request an action or explicitly enable safety alerts.\n\n"
-            "Voice command — records only after you press the button and approve the recording.\n"
-            "Browser — 'Open YouTube', 'Search YouTube for Python tutorials', 'Search Google for binary trees'.\n"
-            "Apps — 'Open Calculator', 'Open Notepad', 'Open VS Code', 'Open File Explorer'; only allowlisted apps can launch.\n"
-            "Screen — 'Take a screenshot', 'Explain what is on my screen' (separate AI-upload confirmation), 'Read the text on my screen' (local OCR).\n"
-            "Documents — 'Open my document', 'Open my document and find the word algorithm'; supports text/code files and, with dependencies, PDF/DOCX.\n"
-            "Vision — 'Describe the scene', 'Is there a TV?', 'Read the text', 'Capture photo'. Camera descriptions are on request.\n"
-            "Input — one unified 'Air virtual keyboard…' works system-wide in the currently focused Windows app. Use mouse clicks, hand gestures, or voice commands such as 'type exactly hello world'; literal text is not submitted automatically. Enable Hand gestures for pointer movement, pinch-click, scrolling and tab switching.\n"
-            "Writing — 'Write an email to my professor' can prepare a Gemini-assisted draft. Sending requires an authenticated provider, final-content review and explicit confirmation.\n"
-            "Memory — explicitly save, search, or delete local notes. Delete/save actions require confirmation.\n"
-            "Listening — use the Listening ON/OFF master toggle. Say the configured wake phrase to begin continuous conversation; 30 seconds without speech returns to wake mode.\n"
-            "Camera — off by default; turn it on explicitly to keep it running, or request a camera task to open it temporarily.\n"
-            "Sign language — current included classifier is isolated-label only and requires training; it is not continuous sentence translation. See CONTINUOUS_ISL.md.\n"
-            "Safety — proactive depth alerts are OFF by default. Depth/motion estimates are not validated navigation or collision avoidance.\n\n"
-            "See COMMAND_CATALOGUE.md for a wider list of supported commands, command aliases, architecture details and integration setup.")
+        """Display scrollable, searchable-by-visual-scan command reference in the app."""
+        quick_path = self.project_dir / "QUICK_START_COMMANDS.md"
+        catalogue_path = self.project_dir / "COMMAND_CATALOGUE.md"
+        sections = []
+        for path, heading in ((quick_path, "QUICK START"), (catalogue_path, "FULL COMMAND CATALOGUE")):
+            if path.is_file():
+                try:
+                    sections.append(f"{heading}\n{'=' * len(heading)}\n\n" + path.read_text(encoding="utf-8"))
+                except OSError as exc:
+                    sections.append(f"{heading}\nCould not read {path.name}: {exc}")
+        if not sections:
+            sections.append(
+                "Try these commands:\n"
+                "• Open YouTube / Open Word / Open Excel\n"
+                "• Reduce system volume / Set volume to 35 percent\n"
+                "• Type exactly hello world (confirm; Arthur restores the original foreground window)\n                • Type hello in Microsoft Word / Type hello in YouTube search box\n                • Close YouTube (confirm to close its active browser tab)\n"
+                "• Turn on camera / Turn off camera\n"
+                "• Enable finger tracking / Calibrate finger tracking\n"
+                "• Remember that I left my keys in the bag\n"
+                "• Enroll my face\n"
+                "• Get directions from Salt Lake to Howrah\n"
+                "• Start sign language translation (requires the full ISL model)"
+            )
+        window = tk.Toplevel(self.root)
+        window.title("Arthur — Help and voice commands")
+        window.geometry("900x680")
+        window.minsize(620, 420)
+        window.transient(self.root)
+        container = ttk.Frame(window, padding=12)
+        container.pack(fill="both", expand=True)
+        ttk.Label(container, text="Voice commands and feature requirements", style="Subheader.TLabel").pack(anchor="w", pady=(0, 8))
+        body = ttk.Frame(container)
+        body.pack(fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(body, orient="vertical")
+        reference = tk.Text(body, wrap="word", yscrollcommand=scrollbar.set, font=("Consolas", 10),
+                            padx=12, pady=10, bg="#0c151c", fg=self.TEXT, insertbackground=self.TEXT)
+        scrollbar.configure(command=reference.yview)
+        scrollbar.pack(side="right", fill="y")
+        reference.pack(side="left", fill="both", expand=True)
+        reference.insert("1.0", "\n\n".join(sections))
+        reference.configure(state="disabled")
+        footer = ttk.Frame(container)
+        footer.pack(fill="x", pady=(8, 0))
+        ttk.Label(footer, text="Voice actions remain subject to confirmations and installed models/API access.", style="Muted.TLabel").pack(side="left")
+        self._button(footer, "Close", window.destroy).pack(side="right")
 
     def run(self):
         self.root.mainloop()

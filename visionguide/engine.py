@@ -39,18 +39,28 @@ class VisionWorker:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
+        self._set_status("Starting camera and vision model…")
         self._thread = threading.Thread(target=self._run, name="visionguide-camera", daemon=True)
         self._thread.start()
 
     def _set_status(self, status: str, error: str = "") -> None:
         with self._lock:
             self._status = status
-            if error:
-                self._error = error
+            self._error = error
 
     def _run(self) -> None:
         try:
             from ultralytics import YOLO
+            model_file = Path(self.model_path)
+            if not model_file.is_file():
+                raise FileNotFoundError(f"Object-detection model is missing: {model_file}")
+            with model_file.open("rb") as handle:
+                header = handle.read(160)
+            if b"git-lfs.github.com/spec/v1" in header:
+                raise RuntimeError(
+                    f"{model_file.name} is only a Git LFS pointer, not model weights. "
+                    "Download the actual model file or, in a Git clone with Git LFS installed, run `git lfs pull`."
+                )
             self._set_status("Loading object-detection model…")
             model = YOLO(self.model_path)
             self._set_status("Opening camera…")
@@ -68,11 +78,32 @@ class VisionWorker:
             last_fps_t = time.monotonic()
             self._set_status("Camera active — audio is on demand")
 
+            consecutive_read_failures = 0
             while not self._stop.is_set():
                 ok, frame = self._capture.read()
                 if not ok:
-                    time.sleep(0.03)
+                    consecutive_read_failures += 1
+                    if isinstance(self.camera_index, str) and consecutive_read_failures >= 45:
+                        self._set_status("Reconnecting camera stream…", "The network camera stopped delivering frames; retrying the stream.")
+                        try:
+                            self._capture.release()
+                        except Exception:
+                            pass
+                        time.sleep(1.0)
+                        self._capture = cv2.VideoCapture(self.camera_index)
+                        if self._capture.isOpened():
+                            self._capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                            self._set_status("Camera stream reconnected")
+                            consecutive_read_failures = 0
+                        else:
+                            raise RuntimeError(
+                                f"Phone/network camera stream {self.camera_index!r} is not reachable. "
+                                "Check that the phone and laptop are on the same Wi-Fi network and that the phone camera app's stream URL is correct."
+                            )
+                    else:
+                        time.sleep(0.03)
                     continue
+                consecutive_read_failures = 0
                 now = time.monotonic()
                 frame_count += 1
                 if now - last_inference >= 1.0 / self.target_fps:

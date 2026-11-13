@@ -217,6 +217,15 @@ class ISLRecognizer:
                 "Swin3D checkpoint not found:\n"
                 f"{self.checkpoint_path}"
             )
+        with self.checkpoint_path.open("rb") as handle:
+            checkpoint_header = handle.read(160)
+        if b"git-lfs.github.com/spec/v1" in checkpoint_header:
+            raise RuntimeError(
+                "The ISL checkpoint in this project is a Git LFS pointer, not the trained model weights. "
+                "The full checkpoint is approximately 228 MB. Fetch the actual file with `git lfs pull` "
+                "from the repository clone, or obtain the model artifact from the project maintainer. "
+                "ISL mode cannot run until the actual checkpoint is present."
+            )
 
         logger.info("Loading Swin3D-S checkpoint...")
 

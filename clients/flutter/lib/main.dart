@@ -243,7 +243,7 @@ class _CommandHomePageState extends State<CommandHomePage> {
             icon: Icon(_whisperRecording ? Icons.stop_circle : Icons.graphic_eq), label: Text(_whisperRecording ? 'Stop Whisper recording' : 'Record for Whisper')),
         ]),
         const SizedBox(height: 8),
-        const Text('Sensitive operations display a confirmation preview before execution. “Record for Whisper” sends the temporary audio file to your configured VisionGuideAI server for local Whisper transcription; it is not sent to Gemini and the temporary upload is deleted after transcription. Camera narration remains controlled by the device client.'),
+        const Text('Sensitive operations display a confirmation preview before execution. “Record for Whisper” sends the temporary audio file to your configured VisionGuideAI server for local Whisper transcription; it is not sent to Groq and the temporary upload is deleted after transcription. Camera narration remains controlled by the device client.'),
         const SizedBox(height: 20),
         Text('Activity', style: Theme.of(context).textTheme.titleLarge),
         const SizedBox(height: 8),

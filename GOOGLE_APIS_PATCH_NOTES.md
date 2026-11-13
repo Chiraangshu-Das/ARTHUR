@@ -16,12 +16,12 @@ After applying the patch, verify that the existing Python environment and instal
 
 ## Configuration groups
 
-- `GEMINI_API_KEY`: Gemini only. Keep the Gemini key restricted to Gemini API.
+- `GROQ_API_KEY`: primary assistant text, tool-routing, and vision inference. Keep this key private and do not confuse it with Google Cloud keys. Google Workspace and Maps integrations continue to use their configured Google OAuth / Maps credentials.
 - `GOOGLE_MAPS_API_KEY`: Maps Platform REST services used by this Python application: Geocoding, Routes, Weather, Places API (New), Air Quality, Pollen, Time Zone, Roads and explicitly consented Geolocation.
 - `GOOGLE_CLOUD_API_KEY` or `GOOGLE_VISION_API_KEY`: optional Cloud Vision Web Detection key. Enable Cloud Vision API and restrict this separate key to Cloud Vision if visual web search is needed.
 - OAuth desktop client: Gmail and Calendar plus feature-specific profiles for Drive metadata search, Docs, Sheets, Slides, Tasks, People/Contacts, Classroom read operations, Meet-space creation, YouTube search, Forms, Cloud Translation and Cloud Natural Language.
 
-Cloud Translation and Natural Language use OAuth profiles in this build; they do not use the Gemini key or a Maps-only key. Enable each relevant API in the Cloud project, configure the scopes required by the profile in Google Auth Platform, then approve its first-run OAuth flow.
+Cloud Translation and Natural Language use Google OAuth profiles in this build; they do not use the Groq key or a Maps-only key. Enable each relevant API in the Cloud project, configure the scopes required by the profile in Google Auth Platform, then approve its first-run OAuth flow.
 
 A profile may request consent separately from Gmail/Calendar because its token is isolated by feature group. Existing token files should not be copied from another machine or shared between users.
 
@@ -103,6 +103,6 @@ Do not treat successful local tests or a successful OAuth login as proof that ev
 
 - Never commit `.env`, `credentials/`, `data/google_tokens/` or other credential-bearing files.
 - Do not share OAuth refresh tokens, client secrets or API keys in screenshots, issues or archives.
-- Keep Gemini, Maps Platform and Cloud Vision API keys separated according to their intended services and restrictions.
+- Keep Groq credentials separate from Maps Platform and Cloud Vision API keys; Google OAuth credentials remain scoped to the Google Workspace and Cloud services they authorize.
 - Do not disable confirmation gates to work around provider permission errors.
 - Retain a backup of the previous working source files until the updated integration has passed local and live-account acceptance tests.

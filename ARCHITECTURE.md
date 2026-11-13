@@ -13,7 +13,7 @@ Camera frames, microphone recordings, screenshots, face profiles, and local note
 | `main.py` | Desktop entry point or `--serve-api` entry point |
 | `visionguide/app.py` | Tk desktop UI, camera/status controls, speech routing, permission prompts and result display |
 | `visionguide/voice_commands.py` | On-demand microphone recording and Whisper transcription; file-based transcription |
-| `visionguide/semantic_router.py` | Gemini function calling, rule/parser fallback, local intent patterns, embedding similarity, typed `RoutedCommand` |
+| `visionguide/semantic_router.py` | Groq function calling, rule/parser fallback, local intent patterns, embedding similarity, typed `RoutedCommand` |
 | `visionguide/scene_commands.py` | Existing local deterministic command parser |
 | `visionguide/desktop_actions.py` | Website and allowlisted Windows application launchers |
 | `visionguide/integrations/system_controls.py` | Browser playback, display brightness, master audio, Wi-Fi adapter control |
@@ -35,21 +35,21 @@ Camera frames, microphone recordings, screenshots, face profiles, and local note
 
 1. **Capture.** The desktop records audio only after an explicit voice-command action or after the locally armed wake-word flow activates. The Flutter starter supports short device-native speech recognition and recorded audio sent to the service for Whisper transcription.
 2. **Transcribe.** Whisper returns text. It does not execute tools and is not given a shell or application-control interface.
-3. **Route.** `SemanticCommandRouter.route()` attempts Gemini function calling when a Gemini API key is configured. If routing is unavailable, it checks the existing local parser, deterministic high-value patterns, and a SentenceTransformers cosine-similarity matcher. The local similarity model loads on first use and uses `VISIONGUIDE_SEMANTIC_THRESHOLD`.
+3. **Route.** `SemanticCommandRouter.route()` attempts Groq function calling when a Groq API key is configured. If routing is unavailable, it checks the existing local parser, deterministic high-value patterns, and a SentenceTransformers cosine-similarity matcher. The local similarity model loads on first use and uses `VISIONGUIDE_SEMANTIC_THRESHOLD`.
 4. **Validate.** The router returns a `RoutedCommand` with an action name, primitive typed arguments, source, and confidence. Tool names are registered in `_FUNCTIONS`; execution is a separate layer. The executor checks allowed website/app/window names, argument ranges and OS/provider prerequisites.
-5. **Confirm.** Network disconnection, sending messages, calendar writes, and sensitive GUI workflows require a confirmation checkpoint. The API returns a random one-use confirmation ID bound to the `device_id`; the token expires after five minutes and is consumed after approval or cancellation.
+5. **Confirm.** Ordinary text-only requests are sent to Groq directly. State-changing actions (save, update, delete, submit, send, publish), network disconnection, and sensitive GUI/image-upload workflows require a separate confirmation checkpoint. The API returns a random one-use confirmation ID bound to the `device_id`; the token expires after five minutes and is consumed after approval or cancellation.
 6. **Execute.** Local desktop actions execute on Windows. Gmail/Calendar API requests run with the authenticated Google account. A GUI workflow types into a selected known window and leaves a draft open unless a separately confirmed send command is issued.
 7. **Verify and respond.** Result text and status are returned to the desktop, HTTP client, or timer WebSocket. A keyboard shortcut being issued is not proof of final delivery; the user/application status must be checked.
 
 ### Semantic function calling
 
-`visionguide/semantic_router.py` declares functions for websites, apps, vision/document intents, media playback, display/audio/network controls, timers, Gmail, Calendar, GUI drafting and text-only general queries. `automatic_function_calling` is disabled for the router request: Gemini proposes a function and the local code decides what happens next. No model-generated Python or shell string is evaluated.
+`visionguide/semantic_router.py` declares functions for websites, apps, vision/document intents, media playback, display/audio/network controls, timers, Gmail, Calendar, GUI drafting and text-only general queries. `automatic_function_calling` is disabled for the router request: Groq proposes a function and the local code decides what happens next. No model-generated Python or shell string is evaluated.
 
 Calendar routing receives the configured local date/time and `VISIONGUIDE_TIMEZONE` (defaults to `Asia/Kolkata`) so phrases such as “tomorrow at 10” can be resolved. The router should ask for clarification when a required event detail or recipient is ambiguous.
 
-Fallback order when the Gemini API is unavailable: legacy local parser → high-value deterministic patterns → local SentenceTransformers similarity → unmatched intent. The API may then route an unmatched textual query to text-only Gemini; the desktop asks before sending the transcription to Gemini.
+Fallback order when Groq function calling is unavailable: legacy local parser → high-value deterministic patterns → local SentenceTransformers similarity → text-only Groq query. Ordinary text-only requests are sent directly to Groq by both the desktop client and authenticated API client, without a second confirmation prompt. The current request text is sent; prior conversation context remains local unless `VISIONGUIDE_SHARE_CONVERSATION_CONTEXT=1` is explicitly enabled.
 
-The text-only Gemini fallback does not automatically include camera frames or screenshots. Visual requests that require an external vision service follow a separate image-selection and permission path.
+The text-only Groq fallback does not automatically include camera frames or screenshots. Visual requests that require an external vision service follow a separate image-selection and permission path.
 
 ## 3. Client-server design
 
@@ -118,7 +118,7 @@ These timers are not persistent reminders: they do not survive process terminati
 
 Scopes are defined in the module. OAuth consent and test-user configuration must be completed in Google Cloud Console. API quota, revoked grants, scope changes and account policy errors are returned through the provider adapter; remove the local token file to force re-consent after changing scopes.
 
-The desktop's GUI path is separate: it uses Gmail's compose keyboard shortcut, pastes the user-approved recipient/subject and Gemini-generated body, then leaves the draft for review. The send action activates Gmail and issues Ctrl+Enter only after explicit confirmation.
+The desktop's GUI path is separate: it uses Gmail's compose keyboard shortcut, pastes the user-approved recipient/subject and Groq-generated body, then leaves the draft for review. The send action activates Gmail and issues Ctrl+Enter only after explicit confirmation.
 
 The API and GUI paths have different execution and verification characteristics. An API draft operation is not the same as typing into Gmail's graphical interface, and neither should be reported as successfully sent until the relevant provider or application confirms the result.
 
@@ -156,7 +156,7 @@ MediaPipe remains part of the hand-gesture control path; it is not the current I
 - Confirmation tokens are one-use, device-bound and time-limited.
 - Wi-Fi, Calendar and send actions report failure when the operating system/provider rejects the call.
 - The project does not claim that inferred distance, detection absence or a single image proves a path safe.
-- Local inference does not imply that every feature in the wider application is offline; Gemini, Google Workspace and Google Cloud adapters require their respective credentials and network access.
+- Local inference does not imply that every feature in the wider application is offline; Groq, Google Workspace and Google Cloud adapters require their respective credentials and network access.
 - Face recognition is limited to locally enrolled profiles. It is not a general-purpose stranger-identification or internet face-search feature.
 - Optional DeepFace embedding fusion does not establish biometric identity accuracy or suitability for security-critical authentication.
 
