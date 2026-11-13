@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import queue
 import threading
@@ -19,6 +20,15 @@ class EchoCancelledCapture:
     INPUT_RATE = 48_000
     OUTPUT_RATE = 16_000
 
+    # Calibrated from the user's controlled Windows speaker-loopback test:
+    # far-end-only microphone RMS was approximately 0.00019 and measured
+    # suppression was 6.1 dB on Echoff's rolling diagnostic (8.6 dB offline).
+    # Keep a meaningful suppression requirement, but do not require a loud
+    # acoustic echo that this laptop's microphone does not produce.
+    DEFAULT_MIN_SUPPRESSION_DB = 5.0
+    DEFAULT_MIN_RAW_RMS = 0.0001
+    DEFAULT_WARMUP_SECONDS = 7.5
+
     def __init__(self, max_buffer_seconds: float = 10.0):
         self._frames: queue.Queue[tuple[Any, bool]] = queue.Queue(
             maxsize=max(16, int(max_buffer_seconds / 0.02))
@@ -30,7 +40,21 @@ class EchoCancelledCapture:
         self._first_frame = threading.Event()
         self._error: str | None = None
         self._last_status: dict[str, Any] = {}
+        self._readiness_config: dict[str, float] = {}
         self._lock = threading.RLock()
+
+    @staticmethod
+    def _bounded_env_float(
+        name: str, default: float, minimum: float, maximum: float
+    ) -> float:
+        """Read a finite numeric environment value and clamp it safely."""
+        try:
+            value = float(os.getenv(name, str(default)))
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(value):
+            return default
+        return max(minimum, min(maximum, value))
 
     @staticmethod
     def downsample_48k_to_16k(samples):
@@ -52,7 +76,20 @@ class EchoCancelledCapture:
             import numpy as np
 
             state = getattr(frame, "state", None)
-            echo_ready = bool(getattr(state, "echo_path_ready", False))
+            vendor_ready = bool(getattr(state, "echo_path_ready", False))
+            if vendor_ready:
+                self._ready.set()
+
+            # Echoff's readiness value is a rolling signal-quality heuristic.
+            # It may turn false during double-talk because the deliberately
+            # preserved near-end voice raises the raw/clean energy ratio.
+            # Once the calibrated echo path has passed its startup gate, keep
+            # accepting AEC-clean frames for this capture session. Otherwise
+            # the very speech we need to detect would be dropped mid-utterance.
+            echo_ready = self._ready.is_set()
+            self._last_status["vendor_echo_path_ready"] = vendor_ready
+            self._last_status["echo_path_ready_latched"] = echo_ready
+
             clean = self.downsample_48k_to_16k(frame.microphone_clean)
             if clean.size == 0:
                 return
@@ -97,12 +134,35 @@ class EchoCancelledCapture:
                 ) from exc
 
             delay_ms = int(os.getenv("VISIONGUIDE_AEC_STREAM_DELAY_MS", "50"))
-            warmup_seconds = float(os.getenv("VISIONGUIDE_AEC_WARMUP_SECONDS", "7.5"))
-            warmup_seconds = max(1.0, min(7.5, warmup_seconds))
+            warmup_seconds = self._bounded_env_float(
+                "VISIONGUIDE_AEC_WARMUP_SECONDS",
+                self.DEFAULT_WARMUP_SECONDS,
+                1.0,
+                7.5,
+            )
+            min_suppression_db = self._bounded_env_float(
+                "VISIONGUIDE_AEC_MIN_SUPPRESSION_DB",
+                self.DEFAULT_MIN_SUPPRESSION_DB,
+                3.0,
+                30.0,
+            )
+            min_raw_rms = self._bounded_env_float(
+                "VISIONGUIDE_AEC_MIN_RAW_RMS",
+                self.DEFAULT_MIN_RAW_RMS,
+                0.00001,
+                0.05,
+            )
+            self._readiness_config = {
+                "echo_path_warmup_s": warmup_seconds,
+                "echo_path_min_suppression_db": min_suppression_db,
+                "echo_path_quality_min_raw_rms": min_raw_rms,
+            }
             config = AecConfig(
                 noise_suppression=True,
                 stream_delay_ms=max(0, min(500, delay_ms)),
                 echo_path_warmup_s=warmup_seconds,
+                echo_path_min_suppression_db=min_suppression_db,
+                echo_path_quality_min_raw_rms=min_raw_rms,
             )
             reference_device = os.getenv("VISIONGUIDE_AEC_REFERENCE_DEVICE", "").strip() or None
             microphone_device = os.getenv("VISIONGUIDE_AEC_MICROPHONE_DEVICE", "").strip() or None
@@ -232,10 +292,29 @@ class EchoCancelledCapture:
             snapshot = self._capture.status()
             data = snapshot.to_dict() if hasattr(snapshot, "to_dict") else {}
             if isinstance(data, dict):
+                data = dict(data)
+                vendor_ready = data.get(
+                    "echo_path_ready",
+                    self._last_status.get("vendor_echo_path_ready", False),
+                )
+                data["echoff_echo_path_ready"] = bool(vendor_ready)
+                data["echo_path_ready"] = self.echo_path_ready
+                data["echo_path_ready_latched"] = self.echo_path_ready
+                if self._readiness_config:
+                    data["arthur_aec_readiness_config"] = dict(self._readiness_config)
                 return data
         except Exception as exc:
-            return {"running": self.is_running, "echo_path_ready": self.echo_path_ready, "error": str(exc)}
-        return {"running": self.is_running, "echo_path_ready": self.echo_path_ready}
+            return {
+                "running": self.is_running,
+                "echo_path_ready": self.echo_path_ready,
+                "echo_path_ready_latched": self.echo_path_ready,
+                "error": str(exc),
+            }
+        return {
+            "running": self.is_running,
+            "echo_path_ready": self.echo_path_ready,
+            "echo_path_ready_latched": self.echo_path_ready,
+        }
 
     def stop(self) -> None:
         with self._lock:

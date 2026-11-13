@@ -1,10 +1,5 @@
-visionguide/app.py
 visionguide/audio_echo.py
-visionguide/voice_commands.py
-visionguide/voice_interrupts.py
-tests/test_audio_echo.py
-tests/test_speech_interruptions.py
-requirements-aec.txt
+ tests/test_audio_echo.py
 install_patch.ps1
-AEC_AUDIO_FIX_GUIDE.md
 README_INSTALL.txt
+AEC_READINESS_CALIBRATION.md
