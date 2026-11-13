@@ -49,6 +49,8 @@ from visionguide.integrations.gui_automation import (
 from visionguide.memory import LocalMemory
 from visionguide.conversation import ConversationContext
 from visionguide.voice_responses import natural_action_response
+from visionguide.speech_renderer import render_for_speech
+from visionguide.voice_interrupts import parse_speech_interrupt
 from visionguide.personalization import normalize_preferred_name, personalize_spoken_response
 from visionguide.perception import Detection, draw_detections, summarize_scene
 from visionguide.safety import SafetyEngine
@@ -113,6 +115,16 @@ class ArthurApp:
         self._conversation_command_done = threading.Event()
         self._conversation_command_done.set()
         self._conversation_lock = threading.Lock()
+        self._speech_interrupt_lock = threading.Lock()
+        self._speech_interrupt_stop = threading.Event()
+        self._speech_interrupt_done = threading.Event()
+        self._speech_interrupt_done.set()
+        self._speech_interrupt_thread: threading.Thread | None = None
+        self._speech_interrupt_restart_pending = threading.Event()
+        self._aec_audio = None
+        self._aec_error: str | None = None
+        self._aec_start_lock = threading.RLock()
+        self._aec_starting = threading.Event()
         self._camera_explicitly_enabled = False
         self._camera_task_lock = threading.Lock()
         self._last_model_error_message = ""
@@ -219,6 +231,11 @@ class ArthurApp:
         self._button(quick, "Describe scene", self.describe_scene, primary=True).grid(row=0, column=0, sticky="ew", padx=(0, 5), pady=3)
         self._button(quick, "Scan / read text", self.scan_document).grid(row=0, column=1, sticky="ew", padx=5, pady=3)
         self._button(quick, "Voice command", self.voice_command).grid(row=0, column=2, sticky="ew", padx=(5, 0), pady=3)
+        self._button(quick, "Pause speech", self.pause_speech).grid(row=1, column=0, sticky="ew", padx=(0, 5), pady=3)
+        self._button(quick, "Resume speech", self.resume_speech).grid(row=1, column=1, sticky="ew", padx=5, pady=3)
+        self._button(quick, "Cancel speech", self.cancel_speech).grid(row=1, column=2, sticky="ew", padx=(5, 0), pady=3)
+        self.root.bind_all("<Escape>", lambda _event: self.pause_speech())
+        self.root.bind_all("<Control-Shift-r>", lambda _event: self.resume_speech())
 
         right = ttk.Frame(body, style="Panel.TFrame", padding=12)
         right.grid(row=0, column=1, sticky="nsew")
@@ -324,14 +341,252 @@ class ArthurApp:
         preferences = self.action_history.get_preferences(slug) if slug else {}
         self.active_preferred_name = normalize_preferred_name(preferences.get("preferred_name"))
 
-    def _say(self, text: object, priority: bool = False, *, address_user: bool = True) -> None:
-        """Speak through one personalization boundary for local and AI responses."""
-        spoken = personalize_spoken_response(
+    def _say(
+        self, text: object, priority: bool = False, *, address_user: bool = True, interruptible: bool = True
+    ) -> None:
+        """Render and speak; full-duplex listening is allowed only with a warmed AEC path."""
+        personalized = personalize_spoken_response(
             text,
             self.active_preferred_name,
             address_user=address_user,
         )
+        spoken = render_for_speech(personalized)
         self.speech.say(spoken, priority=priority)
+        if interruptible and self.conversation_active and not self._closed:
+            if self._aec_audio is not None and getattr(self._aec_audio, "is_running", False):
+                self._start_speech_interrupt_listener()
+            else:
+                # Start loopback capture after queuing speech. The SAPI utterance
+                # gives WASAPI a real render reference during Echoff startup.
+                self._start_echo_cancelled_capture_async()
+
+    def _start_echo_cancelled_capture_async(self) -> None:
+        if self._closed or not self.conversation_active:
+            return
+        with self._aec_start_lock:
+            if self._aec_starting.is_set():
+                return
+            if self._aec_audio is not None and getattr(self._aec_audio, "is_running", False):
+                self._start_speech_interrupt_listener()
+                return
+            self._aec_starting.set()
+
+        def start_capture() -> None:
+            try:
+                if self._start_echo_cancelled_capture() and self.speech.is_busy and self.conversation_active:
+                    # If an existing listener is still active it will switch to
+                    # the new AEC stream itself; otherwise this starts a new one.
+                    self._start_speech_interrupt_listener()
+            finally:
+                self._aec_starting.clear()
+
+        threading.Thread(target=start_capture, name="arthur-aec-start", daemon=True).start()
+
+    def _start_echo_cancelled_capture(self) -> bool:
+        """Start the speaker-reference AEC stream for the active voice conversation."""
+        if self._closed or not self.conversation_active:
+            return False
+        if self._aec_audio is not None and getattr(self._aec_audio, "is_running", False):
+            return True
+        try:
+            from visionguide.audio_echo import EchoCancelledCapture
+
+            capture = EchoCancelledCapture()
+            capture.start()
+            self._aec_audio = capture
+            self._aec_error = None
+            self._async_messages.put(("audio_echo_status", "Acoustic echo cancellation is active for voice interruption."))
+            return True
+        except Exception as exc:
+            self._aec_audio = None
+            self._aec_error = str(exc)
+            self._async_messages.put((
+                "audio_echo_status",
+                "Acoustic echo cancellation is unavailable: " + str(exc) +
+                ". ARTHUR will not transcribe microphone audio while speaking; use Escape or Pause speech to interrupt."
+            ))
+            return False
+
+    def _stop_echo_cancelled_capture(self) -> None:
+        capture = self._aec_audio
+        self._aec_audio = None
+        if capture is not None:
+            try:
+                capture.stop()
+            except Exception as exc:
+                self._async_messages.put(("audio_echo_status", "AEC capture shutdown warning: " + str(exc)))
+
+    def _stop_speech_interrupt_listener(self) -> None:
+        self._speech_interrupt_stop.set()
+        while not self._speech_interrupt_done.wait(0.05):
+            if self._closed:
+                break
+
+    def _start_speech_interrupt_listener(self) -> None:
+        """Listen for barge-in only through a speaker-reference AEC-cleaned stream."""
+        if not self.conversation_active or self._closed:
+            return
+        if not self.speech.is_paused and (
+            self._aec_audio is None or not getattr(self._aec_audio, "is_running", False)
+        ):
+            return
+        with self._speech_interrupt_lock:
+            if self._speech_interrupt_thread and self._speech_interrupt_thread.is_alive():
+                if not self._speech_interrupt_done.is_set():
+                    # The previous consumer may still be finishing Whisper on a
+                    # captured (not live) buffer. Defer the next listener instead
+                    # of opening a second mic consumer or losing this speech turn.
+                    if self._speech_interrupt_stop.is_set() and not self._speech_interrupt_restart_pending.is_set():
+                        self._speech_interrupt_restart_pending.set()
+
+                        def restart_after_previous_listener() -> None:
+                            try:
+                                if self._speech_interrupt_done.wait(timeout=12.0):
+                                    if (not self._closed and self.conversation_active
+                                            and self.speech.is_busy):
+                                        self._start_speech_interrupt_listener()
+                            finally:
+                                self._speech_interrupt_restart_pending.clear()
+
+                        threading.Thread(
+                            target=restart_after_previous_listener,
+                            name="arthur-speech-interrupt-restart",
+                            daemon=True,
+                        ).start()
+                    return
+                self._speech_interrupt_thread.join(timeout=0.05)
+                if self._speech_interrupt_thread.is_alive():
+                    return
+            self._speech_interrupt_stop.clear()
+            self._speech_interrupt_done.clear()
+            self._speech_interrupt_thread = threading.Thread(
+                target=self._speech_interrupt_loop,
+                name="arthur-speech-interrupt-listener",
+                daemon=True,
+            )
+            self._speech_interrupt_thread.start()
+
+    def _speech_interrupt_loop(self) -> None:
+        """Use AEC while speaking; use raw mic only after SAPI has paused playback."""
+        from visionguide.voice_commands import record_and_transcribe, transcribe_audio_samples
+
+        try:
+            model_name = os.getenv("VISIONGUIDE_INTERRUPT_MODEL", "base").strip() or "base"
+            while (
+                not self._speech_interrupt_stop.is_set()
+                and self.conversation_active
+                and not self._closed
+                and self.speech.is_busy
+            ):
+                if self.speech.is_paused:
+                    # SAPI has purged playback. Release Echoff's input stream and
+                    # open a raw mic only for the silent pause window.
+                    self._stop_echo_cancelled_capture()
+                    time.sleep(max(0.35, min(1.0, float(os.getenv("VISIONGUIDE_PAUSED_MIC_GUARD_SECONDS", "0.55")))))
+                    if self._speech_interrupt_stop.is_set() or not self.speech.is_paused:
+                        continue
+                    transcript = record_and_transcribe(
+                        duration_seconds=2.0,
+                        model_name=model_name,
+                        stop_event=self._speech_interrupt_stop,
+                    )
+                else:
+                    capture = self._aec_audio
+                    if capture is None or not getattr(capture, "is_running", False):
+                        # Fail closed: no raw microphone is opened while TTS is
+                        # playing. Escape/Pause speech remains the safe fallback.
+                        return
+                    if not capture.wait_until_ready(timeout=0.20):
+                        capture.clear_pending()
+                        capture.check_health()
+                        continue
+                    samples = capture.record_samples(
+                        1.8,
+                        stop_event=self._speech_interrupt_stop,
+                        require_echo_ready=True,
+                    )
+                    if self._speech_interrupt_stop.is_set():
+                        return
+                    if samples.size < 8_000:
+                        continue
+                    import numpy as np
+                    if float(np.sqrt(np.mean(np.square(samples, dtype=np.float32)))) < 0.004:
+                        continue
+                    transcript = transcribe_audio_samples(samples, model_name=model_name)
+
+                if self._speech_interrupt_stop.is_set():
+                    return
+                parsed = parse_speech_interrupt(transcript, allow_unaddressed_resume=self.speech.is_paused)
+                if parsed is None:
+                    continue
+                if parsed.kind == "pause":
+                    self.speech.pause()
+                    self._async_messages.put(("speech_interrupt", ("pause", "")))
+                elif parsed.kind == "resume":
+                    resumed = self.speech.resume()
+                    if resumed:
+                        # Resumed playback becomes the new WASAPI reference.
+                        self._start_echo_cancelled_capture_async()
+                    self._async_messages.put(("speech_interrupt", ("resume", "" if resumed else "unavailable")))
+                elif parsed.kind == "cancel":
+                    self.speech.cancel()
+                    self._async_messages.put(("speech_interrupt", ("cancel", "")))
+                    return
+                else:
+                    self._conversation_command_done.clear()
+                    self.speech.cancel()
+                    self._async_messages.put(("speech_interrupt", ("command", parsed.command)))
+                    return
+        except Exception as exc:
+            self._async_messages.put(("speech_interrupt_error", str(exc)))
+        finally:
+            self._speech_interrupt_done.set()
+
+    def _wait_for_speech_and_interrupt_listener(self) -> None:
+        """Wait for SAPI playback and its AEC-cleaned barge-in consumer to release audio."""
+        while self.speech.is_busy:
+            if self._closed or self._conversation_stop.is_set():
+                self._speech_interrupt_stop.set()
+                if self.speech.is_paused:
+                    self.speech.cancel()
+            time.sleep(0.05)
+        # Stop the AEC barge-in consumer as soon as playback ends. The normal
+        # conversation recorder becomes the only reader after the output guard.
+        self._speech_interrupt_stop.set()
+        self._speech_interrupt_done.wait(timeout=3.0)
+        # Let the physical output endpoint drain before any raw-microphone fallback.
+        time.sleep(max(0.0, min(1.5, float(os.getenv("VISIONGUIDE_TTS_MIC_GUARD_SECONDS", "1.35")))))
+
+    def _record_conversation_text(self, duration_seconds: float, *, stop_event=None) -> str:
+        """Use the persistent AEC stream when available, otherwise record only after TTS ends."""
+        from visionguide.voice_commands import record_and_transcribe, transcribe_audio_samples
+
+        if self.speech.is_busy and not self.speech.is_paused:
+            self.speech.wait_until_idle(timeout=None)
+            time.sleep(max(0.0, min(2.5, float(os.getenv("VISIONGUIDE_TTS_MIC_GUARD_SECONDS", "1.35")))))
+        if self._aec_starting.is_set():
+            self._aec_starting.wait(timeout=9.0)
+        capture = self._aec_audio
+        if capture is not None and getattr(capture, "is_running", False):
+            try:
+                capture.clear_pending()
+                samples = capture.record_samples(
+                    duration_seconds, stop_event=stop_event, require_echo_ready=False,
+                )
+                return transcribe_audio_samples(samples, model_name="base")
+            except Exception as exc:
+                self._async_messages.put((
+                    "audio_echo_status",
+                    "AEC capture failed; switching to half-duplex microphone capture: " + str(exc),
+                ))
+                self._stop_echo_cancelled_capture()
+
+        # Safe half-duplex fallback: never record while ARTHUR is speaking.
+        self.speech.wait_until_idle(timeout=None)
+        time.sleep(max(0.0, min(1.5, float(os.getenv("VISIONGUIDE_TTS_MIC_GUARD_SECONDS", "1.35")))))
+        return record_and_transcribe(
+            duration_seconds=duration_seconds, model_name="base", stop_event=stop_event,
+        )
 
     @staticmethod
     def _parse_voice_confirmation(transcript: str) -> bool | None:
@@ -345,30 +600,116 @@ class ArthurApp:
         return None
 
     def _ask_yes_no(self, title: str, message: str, parent=None) -> bool:
-        """Use spoken confirmation during Arthur conversations; use a dialog otherwise."""
+        """Request a clear yes/no after all ARTHUR playback has stopped.
+
+        The full confirmation text remains on screen. The spoken prompt is short;
+        recording starts only after SAPI is idle and the physical output has drained.
+        During this capture the normal barge-in consumer is stopped, so exactly one
+        component owns the microphone samples.
+        """
         if not self.conversation_active:
             return messagebox.askyesno(title, message, parent=parent or self.root)
-        prompt = f"{title}. {message[:1100]}. Please say yes or no."
-        self._say(prompt[:1400])
-        self.speech.wait_until_idle(timeout=25.0)
-        try:
-            from visionguide.voice_commands import record_and_transcribe
-            response = record_and_transcribe(duration_seconds=10.0, model_name="base")
-        except Exception as exc:
-            self._append_output(f"Voice confirmation failed closed: {exc}")
-            self._say("I could not confirm that safely, so I cancelled the action.")
+
+        self._stop_speech_interrupt_listener()
+        self.speech.cancel()
+        if not self.speech.wait_until_idle(timeout=8.0):
+            self.speech.cancel()
+            self._append_output("Could not stop the previous spoken response. The requested action was not confirmed.")
+            self.status_var.set("Confirmation unavailable · action not executed")
             return False
-        decision = self._parse_voice_confirmation(response)
+
+        prompt = f"{title}. Please review the full details on screen. Say yes or no after I finish speaking."
+        self._say(prompt, priority=True, interruptible=False)
+        self.status_var.set("Speaking confirmation prompt…")
+        if not self.speech.wait_until_idle(timeout=15.0):
+            self.speech.cancel()
+            if not self.speech.wait_until_idle(timeout=3.0):
+                self._append_output("The confirmation prompt could not be stopped safely. The action was not executed.")
+                self.status_var.set("Confirmation unavailable · action not executed")
+                return False
+
+        drain_seconds = max(1.0, min(2.5, float(os.getenv("VISIONGUIDE_TTS_MIC_GUARD_SECONDS", "1.35"))))
+        time.sleep(drain_seconds)
+
+        def play_confirmation_tone() -> None:
+            try:
+                import winsound
+                winsound.Beep(880, 110)
+            except Exception:
+                pass
+
+        def capture_answer() -> str:
+            from visionguide.voice_commands import record_and_transcribe
+
+            # Confirmation is deliberately half-duplex. Close Echoff first so
+            # sounddevice is the only microphone owner and no buffered AEC frames
+            # from the spoken prompt can be mistaken for the user's answer.
+            self._stop_echo_cancelled_capture()
+            play_confirmation_tone()
+            # Let the short cue leave the physical speaker before opening the mic.
+            time.sleep(0.25)
+            return record_and_transcribe(duration_seconds=6.0, model_name="base")
+
+        decision = None
+        try:
+            for attempt in range(2):
+                self.status_var.set("Waiting for yes/no confirmation…")
+                response = capture_answer()
+                decision = self._parse_voice_confirmation(response)
+                if decision is not None:
+                    break
+                if attempt == 0:
+                    self._say("I did not catch a clear answer. Please say yes or no after I finish speaking.", interruptible=False)
+                    if not self.speech.wait_until_idle(timeout=12.0):
+                        self.speech.cancel()
+                        if not self.speech.wait_until_idle(timeout=3.0):
+                            raise RuntimeError("The retry prompt could not be stopped; confirmation recording was not opened.")
+                    time.sleep(drain_seconds)
+        except Exception as exc:
+            self._append_output(f"Voice confirmation capture failed: {exc}")
+            decision = None
+
         if decision is True:
             self._append_output("Voice confirmation received: yes.")
+            self.status_var.set("Confirmation received")
             return True
         if decision is False:
             self._append_output("Voice confirmation received: no. Action cancelled.")
-            self._say("Cancelled, sir.")
+            self.status_var.set("Action cancelled")
+            self._say("Cancelled.", interruptible=False)
             return False
-        self._append_output("No clear yes/no confirmation was transcribed. Action cancelled.")
-        self._say("I did not hear a clear yes or no, so I cancelled the action.")
+
+        self._append_output("No clear yes/no confirmation was transcribed after two attempts. Action cancelled safely.")
+        self.status_var.set("Confirmation not understood · action cancelled")
+        self._say("I could not confirm that safely, so I cancelled the action.", interruptible=False)
         return False
+
+    def pause_speech(self) -> None:
+        self._speech_interrupt_stop.set()
+        self._stop_speech_interrupt_listener()
+        if self.speech.pause():
+            self.status_var.set("Speech paused · listening for continue")
+            self._append_output("Speech paused. Say 'continue' or press Resume speech.")
+            if self.conversation_active:
+                self._start_speech_interrupt_listener()
+        else:
+            self._append_output("No active speech to pause.")
+
+    def resume_speech(self) -> None:
+        self._speech_interrupt_stop.set()
+        self._stop_speech_interrupt_listener()
+        if self.speech.resume():
+            self.status_var.set("Resuming speech…")
+            self._append_output("Resuming the previous response.")
+            if self.conversation_active:
+                self._start_echo_cancelled_capture_async()
+        else:
+            self._append_output("There is no paused response to resume.")
+
+    def cancel_speech(self) -> None:
+        self.speech.cancel()
+        self.status_var.set("Speech cancelled")
+        self._append_output("The current spoken response was cancelled.")
 
     def _set_output(self, text: str):
         text = str(text)
@@ -676,13 +1017,13 @@ class ArthurApp:
             self._maybe_stop_camera()
 
     def _ask_voice_text(self, prompt: str, duration_seconds: float = 10.0) -> str:
-        """Ask for a short spoken value during a live conversation; no cloud upload."""
-        self._say(prompt)
-        self.speech.wait_until_idle(timeout=20.0)
-        from visionguide.voice_commands import record_and_transcribe
-        answer = record_and_transcribe(
-            duration_seconds=max(3.0, min(float(duration_seconds), 12.0)),
-            model_name="base",
+        """Ask for a short spoken value after playback has completed."""
+        self._stop_speech_interrupt_listener()
+        self._say(prompt, interruptible=False)
+        self.speech.wait_until_idle(timeout=None)
+        time.sleep(0.75)
+        answer = self._record_conversation_text(
+            max(3.0, min(float(duration_seconds), 12.0)),
             stop_event=self._conversation_stop,
         )
         return " ".join(str(answer or "").split()).strip()
@@ -1079,10 +1420,32 @@ class ArthurApp:
                         self._route_voice_command(transcript)
                     else:
                         self._conversation_command_done.set()
+                elif action == "speech_interrupt":
+                    kind, payload = result if isinstance(result, (tuple, list)) else (str(result), "")
+                    if kind == "pause":
+                        self._append_output("Speech paused. Say 'Arthur, continue' to resume, or address Arthur with a new command.")
+                        self.status_var.set("Speech paused — listening for Arthur commands")
+                    elif kind == "resume":
+                        if payload == "unavailable":
+                            self._append_output("There is no paused response to resume.")
+                        else:
+                            self._append_output("Resuming the previous response.")
+                            self.status_var.set("Arthur is speaking")
+                    elif kind == "cancel":
+                        self._append_output("The previous spoken response was cancelled.")
+                        self.status_var.set("Listening for your next command")
+                    elif kind == "command":
+                        self._append_output("Arthur heard an interruption: " + str(payload))
+                        self._route_voice_command(str(payload))
+                elif action == "speech_interrupt_error":
+                    self._append_output("Speech interruption listening stopped: " + str(result))
+                elif action == "audio_echo_status":
+                    self._append_output(str(result))
                 elif action == "conversation_end":
                     reason = str(result)
                     self.conversation_active = False
                     self._conversation_stop.set()
+                    self._speech_interrupt_stop.set()
                     self.status_var.set("Wake-word listening active" if self.wake_word_armed else "Listening disabled")
                     if reason == "timeout":
                         self._say("I'll wait for you, sir.")
@@ -1094,7 +1457,7 @@ class ArthurApp:
                         self._say("Okay, sir. I'll wait for you.")
                     if self.wake_word_armed:
                         def restart_after_response():
-                            self.speech.wait_until_idle(timeout=15.0)
+                            self.speech.wait_until_idle(timeout=None)
                             self._async_messages.put(("restart_wake", None))
                         threading.Thread(target=restart_after_response, daemon=True).start()
                 elif action == "restart_wake":
@@ -1103,6 +1466,7 @@ class ArthurApp:
                 elif action == "conversation_error":
                     self.conversation_active = False
                     self._conversation_stop.set()
+                    self._speech_interrupt_stop.set()
                     self._append_output("Continuous listening stopped: " + str(result))
                     self._say("I had a microphone or transcription error, sir.")
                     if self.wake_word_armed:
@@ -2328,6 +2692,7 @@ class ArthurApp:
             self.wake_word_armed = False
             self.conversation_active = False
             self._conversation_stop.set()
+            self._speech_interrupt_stop.set()
             listener, self.wake_word_listener = self.wake_word_listener, None
             if listener:
                 listener.stop()
@@ -2374,37 +2739,50 @@ class ArthurApp:
         self._conversation_command_done.set()
         self.status_var.set("Arthur is active · 30-second inactivity timeout")
         self._append_output("Wake phrase detected. Continuous conversation is active.")
-        self._say("Yes, sir?")
         self._run_async("conversation_loop", self._conversation_loop)
 
     def _conversation_loop(self):
-        from visionguide.voice_commands import record_and_transcribe
         last_activity = time.monotonic()
-        # Wait for Arthur's acknowledgement to finish before recording, to avoid transcribing TTS.
-        self.speech.wait_until_idle(timeout=8.0)
-        while self.wake_word_armed and self.conversation_active and not self._conversation_stop.is_set() and not self._closed:
-            if time.monotonic() - last_activity >= 30.0:
-                self._async_messages.put(("conversation_end", "timeout"))
-                return "timeout"
-            try:
-                transcript = record_and_transcribe(duration_seconds=10.0, model_name="base", stop_event=self._conversation_stop)
-            except Exception as exc:
-                self._async_messages.put(("conversation_error", str(exc)))
-                return "error"
-            if self._conversation_stop.is_set() or not self.conversation_active:
-                return "stopped"
-            transcript = str(transcript).strip()
-            if not transcript:
-                continue
-            last_activity = time.monotonic()
-            self._conversation_command_done.clear()
-            self._async_messages.put(("conversation_transcript", transcript))
-            # Process utterances serially so consecutive chunks do not race command execution.
-            while not self._conversation_command_done.wait(0.1):
-                if self._conversation_stop.is_set() or not self.conversation_active or self._closed:
+        try:
+            # _say queues the acknowledgement first, then starts Echoff on a
+            # background thread while SAPI supplies the loopback reference.
+            self._say("Yes, sir. I'm listening. Go ahead with your request.", interruptible=True)
+            self._wait_for_speech_and_interrupt_listener()
+            if self._aec_starting.is_set():
+                self._aec_starting.wait(timeout=5.0)
+            while self.wake_word_armed and self.conversation_active and not self._conversation_stop.is_set() and not self._closed:
+                if time.monotonic() - last_activity >= 30.0:
+                    self._async_messages.put(("conversation_end", "timeout"))
+                    return "timeout"
+                try:
+                    transcript = self._record_conversation_text(
+                        duration_seconds=10.0, stop_event=self._conversation_stop,
+                    )
+                except Exception as exc:
+                    self._async_messages.put(("conversation_error", str(exc)))
+                    return "error"
+                if self._conversation_stop.is_set() or not self.conversation_active:
                     return "stopped"
-            self.speech.wait_until_idle(timeout=20.0)
-        return "stopped"
+                transcript = str(transcript).strip()
+                if not transcript:
+                    continue
+                last_activity = time.monotonic()
+                self._conversation_command_done.clear()
+                self._async_messages.put(("conversation_transcript", transcript))
+                # Process utterances serially so consecutive chunks do not race command execution.
+                while not self._conversation_command_done.wait(0.1):
+                    if self._conversation_stop.is_set() or not self.conversation_active or self._closed:
+                        return "stopped"
+                self._wait_for_speech_and_interrupt_listener()
+                # A barge-in command may have arrived while the previous response was speaking.
+                while not self._conversation_command_done.wait(0.1):
+                    if self._conversation_stop.is_set() or not self.conversation_active or self._closed:
+                        return "stopped"
+            return "stopped"
+        finally:
+            self._speech_interrupt_stop.set()
+            self._speech_interrupt_done.wait(timeout=2.0)
+            self._stop_echo_cancelled_capture()
 
     def _restart_wake_word_listener(self):
         if self.wake_word_armed and not self._closed and self.wake_word_listener is None and not self.conversation_active:
@@ -2501,6 +2879,10 @@ class ArthurApp:
         self.wake_word_armed = False
         self.conversation_active = False
         self._conversation_stop.set()
+        self._speech_interrupt_stop.set()
+        if self._aec_starting.is_set():
+            self._aec_starting.wait(timeout=4.0)
+        self._stop_echo_cancelled_capture()
         if self.wake_word_listener:
             try: self.wake_word_listener.stop()
             except Exception: pass

@@ -1,0 +1,3 @@
+# Windows speaker-loopback + microphone acoustic echo cancellation for voice barge-in.
+# Echoff 0.3.0 is alpha; validate its selected device pair on the target laptop.
+echoff==0.3.0

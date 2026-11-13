@@ -7,7 +7,7 @@
 
 ## Direct Groq fallback and confirmed document CRUD follow-up (2026-11-13)
 
-The latest overlay validation completed with **180 passed, 4 warnings** after adding tests for direct text-only Groq fallback (desktop and authenticated API), Microsoft Word save/save-as, find-and-replace, selection deletion, Google Docs content-range deletion and Google Drive file-content update. The direct fallback sends the current text request without a second consent dialog; conversation context remains opt-in. State-changing operations retain their confirmation gates.
+The latest overlay validation completed with **203 passed, 4 warnings** after adding tests for direct text-only Groq fallback (desktop and authenticated API), Microsoft Word save/save-as, find-and-replace, selection deletion, Google Docs content-range deletion and Google Drive file-content update. The direct fallback sends the current text request without a second consent dialog; conversation context remains opt-in. State-changing operations retain their confirmation gates.
 
 The test environment is the Linux build container using Python 3.13. The Windows Word COM automation, live Google OAuth/API operations, browser UI and real Groq service still require testing on the target Windows laptop.
 

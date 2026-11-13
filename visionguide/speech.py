@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import queue
+import re
 import threading
 import time
 from dataclasses import dataclass
+
+from visionguide.speech_renderer import split_speech_segments
 
 
 @dataclass(frozen=True)
@@ -13,7 +16,14 @@ class SpeechMessage:
 
 
 class SpeechOutput:
-    """Offline Windows speech output through native SAPI5 on one COM worker thread."""
+    """Interruptible offline Windows speech output through one SAPI5 COM thread.
+
+    All SAPI COM calls stay on the worker thread. Other threads request pause or
+    cancellation through an event; the worker performs the actual SAPI purge.
+    """
+
+    SAPI_ASYNC = 1
+    SAPI_PURGE = 2
 
     def __init__(self, rate: int = 165, enabled: bool = True):
         self.enabled = bool(enabled)
@@ -24,18 +34,25 @@ class SpeechOutput:
         self._voice = None
         self._comtypes = None
         self._comtypes_client = None
+        self._speaking = threading.Event()
+        self._paused = False
+        self._paused_segments: list[str] = []
+        self._control_lock = threading.Lock()
+        self._control_action: str | None = None
+        self._control_event = threading.Event()
+        self._current_text = ""
+        self._state_lock = threading.RLock()
+        self._last_error: str | None = None
 
         if self.enabled:
             try:
-                # Import on the creating (GUI) thread. comtypes initializes COM
-                # for the thread that first imports it; the speech worker then
-                # performs its own balanced CoInitialize/CoUninitialize pair.
                 import comtypes
                 import comtypes.client
                 self._comtypes = comtypes
                 self._comtypes_client = comtypes.client
             except Exception as exc:
                 self.enabled = False
+                self._last_error = str(exc)
                 print(f"[Speech] Native SAPI5 requires comtypes: {exc}")
                 self._ready.set()
                 return
@@ -48,17 +65,66 @@ class SpeechOutput:
             self._thread.start()
             if not self._ready.wait(timeout=8.0):
                 self.enabled = False
-                print("[Speech] Timed out while initializing Windows SAPI5.")
+                self._last_error = "Timed out while initializing Windows SAPI5."
+                print(f"[Speech] {self._last_error}")
 
     @staticmethod
     def _sapi_rate(rate: int) -> int:
         """Map the previous pyttsx3-style rate to SAPI's -10..10 range."""
         return max(-10, min(10, round((int(rate) - 175) / 20)))
 
+    @staticmethod
+    def _remaining_after_current_word(segment: str, status) -> str:
+        """Best-effort word-position resume using SAPI's current input position.
+
+        SAPI reports positions in the input text. If the returned position does
+        not look like a character boundary in this segment, restart the current
+        sentence rather than cutting text at an unsafe offset.
+        """
+        try:
+            position = int(status.InputWordPos)
+            word_length = int(status.InputWordLen)
+        except Exception:
+            return segment
+        if not (0 < position < len(segment)):
+            return segment
+        if not segment[position].isalnum():
+            return segment
+        if segment[position - 1].isalnum():
+            return segment
+        end = min(len(segment), position + max(1, word_length))
+        remainder = segment[end:].lstrip(" ,;:-—")
+        return remainder or ""
+
+    def _set_control(self, action: str) -> None:
+        with self._control_lock:
+            self._control_action = action
+            self._control_event.set()
+
+    def _take_control(self) -> str | None:
+        with self._control_lock:
+            action = self._control_action
+            self._control_action = None
+            self._control_event.clear()
+            return action
+
+    def _has_inflight_message(self) -> bool:
+        # Queue unfinished_tasks includes both queued messages and the message
+        # currently owned by the worker. This closes the get-before-speaking race.
+        with self._queue.mutex:
+            return self._queue.unfinished_tasks > len(self._queue.queue)
+
+    def _flush_queue(self) -> None:
+        while True:
+            try:
+                self._queue.get_nowait()
+                self._queue.task_done()
+            except queue.Empty:
+                break
+
     def _worker(self) -> None:
         com_initialized = False
         try:
-            # COM objects must be created, used, and released on this same thread.
             self._comtypes.CoInitialize()
             com_initialized = True
             self._voice = self._comtypes_client.CreateObject("SAPI.SpVoice")
@@ -66,6 +132,7 @@ class SpeechOutput:
             self._voice.Volume = 100
         except Exception as exc:
             self.enabled = False
+            self._last_error = str(exc)
             print(f"[Speech] Could not initialize Windows SAPI5: {exc}")
             self._ready.set()
             if com_initialized:
@@ -78,23 +145,121 @@ class SpeechOutput:
         self._ready.set()
         try:
             while True:
+                # A paused response keeps the worker alive but prevents later queued
+                # notifications from speaking over the paused answer.
+                while self.is_paused:
+                    time.sleep(0.05)
                 message = self._queue.get()
+                if message is None:
+                    self._queue.task_done()
+                    break
                 try:
-                    if message is None:
-                        break
-                    # SAPI Speak is synchronous by default, preserving queue order.
-                    self._voice.Speak(message.text)
+                    self._speaking.set()
+                    segments = split_speech_segments(message.text)
+                    index = 0
+                    interrupted = False
+                    while index < len(segments):
+                        control = self._take_control()
+                        if control == "cancel":
+                            try:
+                                self._voice.Speak("", self.SAPI_PURGE)
+                            except Exception:
+                                pass
+                            with self._state_lock:
+                                self._paused = False
+                                self._paused_segments = []
+                            interrupted = True
+                            break
+                        if control == "pause":
+                            with self._state_lock:
+                                self._paused = True
+                                self._paused_segments = segments[index:]
+                            interrupted = True
+                            break
+
+                        segment = segments[index]
+                        with self._state_lock:
+                            self._current_text = segment
+                        self._voice.Speak(segment, self.SAPI_ASYNC)
+                        while True:
+                            control = self._take_control()
+                            if control in {"pause", "cancel"}:
+                                try:
+                                    status = self._voice.GetStatus()
+                                except Exception:
+                                    status = None
+                                remainder = segment
+                                if control == "pause" and status is not None:
+                                    remainder = self._remaining_after_current_word(segment, status)
+                                try:
+                                    self._voice.Speak("", self.SAPI_PURGE)
+                                except Exception as exc:
+                                    self._last_error = str(exc)
+                                with self._state_lock:
+                                    if control == "pause":
+                                        remaining = ([remainder] if remainder else []) + segments[index + 1:]
+                                        self._paused_segments = remaining
+                                        self._paused = True
+                                    else:
+                                        self._paused_segments = []
+                                        self._paused = False
+                                interrupted = True
+                                break
+                            try:
+                                status = self._voice.GetStatus()
+                                running = int(status.RunningState)
+                            except Exception as exc:
+                                self._last_error = str(exc)
+                                running = 0
+                            if running == 0:
+                                break
+                            time.sleep(0.04)
+                        if interrupted:
+                            break
+                        index += 1
+                    if interrupted:
+                        with self._state_lock:
+                            if not self._paused:
+                                self._current_text = ""
+                        continue
+                    with self._state_lock:
+                        self._current_text = ""
                 except Exception as exc:
+                    self._last_error = str(exc)
                     print(f"[Speech] Could not speak: {exc}")
                 finally:
+                    self._speaking.clear()
                     self._queue.task_done()
         finally:
+            self._speaking.clear()
             self._voice = None
             if com_initialized:
                 try:
                     self._comtypes.CoUninitialize()
                 except Exception as exc:
                     print(f"[Speech] COM cleanup failed: {exc}")
+
+    @property
+    def is_speaking(self) -> bool:
+        return self._speaking.is_set()
+
+    @property
+    def is_paused(self) -> bool:
+        with self._state_lock:
+            return self._paused
+
+    @property
+    def is_busy(self) -> bool:
+        return self._speaking.is_set() or self._queue.unfinished_tasks > 0 or self.is_paused
+
+    @property
+    def current_text(self) -> str:
+        with self._state_lock:
+            return self._current_text
+
+    @property
+    def last_error(self) -> str | None:
+        return self._last_error
 
     def say(self, text: str, priority: bool = False) -> None:
         text = " ".join(str(text).split()).strip()
@@ -103,45 +268,83 @@ class SpeechOutput:
         if not self.enabled:
             print(f"[Speech disabled] {text}")
             return
-
         if priority:
-            # Drop queued, not-yet-spoken messages. An utterance already in progress
-            # is allowed to finish so SAPI is never manipulated from another thread.
-            while True:
-                try:
-                    self._queue.get_nowait()
-                    self._queue.task_done()
-                except queue.Empty:
-                    break
-
+            self._flush_queue()
         try:
             self._queue.put_nowait(SpeechMessage(text, priority))
         except queue.Full:
             print("[Speech] Output queue full; message was not queued.")
 
-    def wait_until_idle(self, timeout: float = 15.0) -> bool:
-        """Wait until all queued utterances have completed, without blocking forever."""
-        deadline = time.monotonic() + max(0.0, float(timeout))
-        while time.monotonic() < deadline:
-            if self._queue.unfinished_tasks == 0:
+    def pause(self) -> bool:
+        """Pause playback and retain the unspoken remainder for resume()."""
+        if not self.is_busy:
+            return False
+        if self.is_paused:
+            return True
+        self._set_control("pause")
+        return True
+
+    def stop(self) -> bool:
+        """Compatibility alias: stop current playback but retain it for continuation."""
+        return self.pause()
+
+    def resume(self) -> bool:
+        with self._state_lock:
+            if not self._paused or not self._paused_segments:
+                return False
+            remainder = " ".join(self._paused_segments).strip()
+            self._paused_segments = []
+            self._paused = False
+        # The resumed answer takes precedence over queued, stale notifications.
+        self._flush_queue()
+        try:
+            self._queue.put_nowait(SpeechMessage(remainder, priority=True))
+            return True
+        except queue.Full:
+            with self._state_lock:
+                self._paused = True
+                self._paused_segments = split_speech_segments(remainder)
+            return False
+
+    def cancel(self) -> None:
+        """Discard the current and queued response; unlike pause(), it cannot resume."""
+        in_flight = self._speaking.is_set() or self._has_inflight_message()
+        self._flush_queue()
+        with self._state_lock:
+            was_paused = self._paused
+            self._paused = False
+            self._paused_segments = []
+            self._current_text = ""
+        if in_flight:
+            self._set_control("cancel")
+        elif was_paused:
+            self._set_control("cancel")
+            self._take_control()
+
+    def wait_until_idle(self, timeout: float | None = 15.0) -> bool:
+        """Wait for all speech to finish; timeout=None means wait without a cutoff.
+
+        A paused response remains busy until it is resumed or cancelled.
+        """
+        deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+        while True:
+            if not self.is_busy:
                 return True
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
             time.sleep(0.05)
-        return self._queue.unfinished_tasks == 0
 
     def close(self) -> None:
         if not self._thread:
             return
+        self.cancel()
         if self._thread.is_alive():
-            # Preserve the previous shutdown behaviour: discard pending speech and
-            # let the currently playing utterance finish before the worker exits.
-            while True:
-                try:
-                    self._queue.get_nowait()
-                    self._queue.task_done()
-                except queue.Empty:
-                    break
             try:
                 self._queue.put_nowait(None)
             except queue.Full:
-                pass
+                self._flush_queue()
+                try:
+                    self._queue.put_nowait(None)
+                except queue.Full:
+                    pass
             self._thread.join(timeout=6.0)

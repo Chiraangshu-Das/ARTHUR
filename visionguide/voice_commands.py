@@ -7,6 +7,30 @@ _MODEL_NAME = None
 _MODEL_LOCK = threading.Lock()
 
 
+def transcribe_audio_samples(mono_audio, model_name: str = "base") -> str:
+    """Transcribe an already captured mono 16 kHz float waveform with Whisper."""
+    import numpy as np
+    import whisper
+
+    samples = np.asarray(mono_audio, dtype=np.float32).reshape(-1)
+    if samples.size < 1600:
+        return ""
+    global _MODEL, _MODEL_NAME
+    with _MODEL_LOCK:
+        if _MODEL is None or _MODEL_NAME != model_name:
+            _MODEL = whisper.load_model(model_name)
+            _MODEL_NAME = model_name
+        model = _MODEL
+    language = os.getenv("VISIONGUIDE_SPEECH_LANGUAGE", "en").strip().lower()
+    result = model.transcribe(
+        samples,
+        language=None if language == "auto" else language,
+        fp16=False,
+        verbose=False,
+    )
+    return str(result.get("text", "")).strip()
+
+
 def record_and_transcribe(
     duration_seconds: float = 5.0,
     model_name: str = "base",
@@ -47,19 +71,7 @@ def record_and_transcribe(
         if stop_event.is_set():
             return ""
         mono_audio = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
-    with _MODEL_LOCK:
-        if _MODEL is None or _MODEL_NAME != model_name:
-            _MODEL = whisper.load_model(model_name)
-            _MODEL_NAME = model_name
-        model = _MODEL
-    language = os.getenv("VISIONGUIDE_SPEECH_LANGUAGE", "en").strip().lower()
-    result = model.transcribe(
-        mono_audio,
-        language=None if language == "auto" else language,
-        fp16=False,
-        verbose=False,
-    )
-    return str(result.get("text", "")).strip()
+    return transcribe_audio_samples(mono_audio, model_name=model_name)
 
 
 def transcribe_audio_file(file_path: str, model_name: str = "base") -> str:

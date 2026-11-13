@@ -1,0 +1,41 @@
+{
+  "capture_dir": "E:\\Chiraangshu\\MyWorkspace\\ARTHUR\\captures\\echoff-20261114-032359",
+  "loopback_to_raw_energy_alignment": {
+    "lag_ms": 120.0,
+    "normalized_correlation": 0.4587174167134716
+  },
+  "schema_version": "echoff-analysis-v1",
+  "tracks": {
+    "computer_audio": {
+      "clipped_sample_count": 0,
+      "duration_s": 20.0,
+      "frames": 960000,
+      "peak": 0.6474609375,
+      "peak_dbfs": -3.775728564700777,
+      "rms": 0.07215429009351966,
+      "rms_dbfs": -22.834756837202654,
+      "sample_rate_hz": 48000
+    },
+    "microphone_aec": {
+      "clipped_sample_count": 0,
+      "duration_s": 20.0,
+      "frames": 960000,
+      "peak": 0.0013427734375,
+      "peak_dbfs": -57.43994516947061,
+      "rms": 7.086594641032621e-05,
+      "rms_dbfs": -82.99124817050013,
+      "sample_rate_hz": 48000
+    },
+    "microphone_raw": {
+      "clipped_sample_count": 0,
+      "duration_s": 20.0,
+      "frames": 960000,
+      "peak": 0.002349853515625,
+      "peak_dbfs": -52.57918419574472,
+      "rms": 0.00017649388565136242,
+      "rms_dbfs": -75.06540670907782,
+      "sample_rate_hz": 48000
+    }
+  },
+  "whole_run_raw_to_clean_level_change_db": 7.925841461422316
+}

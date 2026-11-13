@@ -1,0 +1,24 @@
+{
+  "config": {
+    "allow_wdmks_microphone_fallback": true,
+    "automatic_gain_control": false,
+    "backend": "auto",
+    "block_duration_s": 0.02,
+    "channels": 1,
+    "echo_path_min_suppression_db": 10.0,
+    "echo_path_quality_min_raw_rms": 0.003,
+    "echo_path_quality_stable_s": 0.25,
+    "echo_path_quality_window_s": 1.0,
+    "echo_path_warmup_s": 7.5,
+    "far_end_active_rms_min": 0.001,
+    "high_pass_filter": true,
+    "noise_suppression": false,
+    "pair_tolerance_s": 0.01,
+    "queue_fatal_s": 15.0,
+    "reference_stall_grace_s": 3.0,
+    "sample_rate": 48000,
+    "startup_timeout_s": 3.0,
+    "stream_delay_ms": 50
+  },
+  "schema_version": "echoff-capture-artifacts-v2"
+}

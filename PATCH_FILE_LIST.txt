@@ -1,8 +1,10 @@
-visionguide/integrations/timers.py
-visionguide/api_server.py
-visionguide/semantic_router.py
 visionguide/app.py
-tests/test_timers.py
-tests/test_reminder_parser.py
+visionguide/audio_echo.py
+visionguide/voice_commands.py
+visionguide/voice_interrupts.py
+tests/test_audio_echo.py
+tests/test_speech_interruptions.py
+requirements-aec.txt
 install_patch.ps1
+AEC_AUDIO_FIX_GUIDE.md
 README_INSTALL.txt
