@@ -4,7 +4,7 @@ import json
 import os
 import re
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta, time as datetime_time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -74,6 +74,9 @@ _FUNCTIONS: list[dict[str, Any]] = [
     {"name": "wifi_set", "description": "Enable or disable a named Windows network adapter. This changes connectivity and requires user confirmation.", "parameters": {"type": "object", "properties": {"enabled": {"type": "boolean"}, "adapter": {"type": "string"}}, "required": ["enabled"]}},
     {"name": "timer_set", "description": "Create a countdown timer or background alert.", "parameters": {"type": "object", "properties": {"seconds": {"type": "integer", "minimum": 1, "maximum": 604800}, "label": {"type": "string"}}, "required": ["seconds"]}},
     {"name": "timer_list", "description": "List active countdown timers.", "parameters": {"type": "object", "properties": {}}},
+    {"name": "reminder_schedule", "description": "Create a persistent one-time or recurring local reminder at a specific date and time. Use an ISO 8601 due_at value and the user's local timezone. Recurrence can be none, daily, weekly, or weekdays. Do not use this for countdowns such as 'in five minutes'; use timer_set for those.", "parameters": {"type": "object", "properties": {"due_at": {"type": "string", "description": "ISO 8601 date-time, including local offset when available"}, "label": {"type": "string"}, "timezone_name": {"type": "string"}, "recurrence": {"type": "string", "enum": ["none", "daily", "weekly", "weekdays"]}}, "required": ["due_at"]}},
+    {"name": "reminder_list", "description": "List pending scheduled date/time reminders, excluding countdown timers.", "parameters": {"type": "object", "properties": {}}},
+    {"name": "reminder_cancel", "description": "Cancel a pending scheduled reminder by its numeric reminder ID; do not cancel countdown timers.", "parameters": {"type": "object", "properties": {"id": {"type": "integer", "minimum": 1}}, "required": ["id"]}},
     {"name": "gmail_unread", "description": "List unread Gmail messages or read their body text aloud. Set include_body true when the user asks to read unread emails; otherwise provide a summary list.", "parameters": {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 20}, "include_body": {"type": "boolean"}}}},
     {"name": "gmail_read_message", "description": "Read the full text content of one Gmail message by its known message ID.", "parameters": {"type": "object", "properties": {"message_id": {"type": "string"}}, "required": ["message_id"]}},
     {"name": "gmail_search", "description": "Search the authenticated Gmail inbox using a Gmail search query.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 50}}, "required": ["query"]}},
@@ -198,7 +201,14 @@ class SemanticCommandRouter:
                 names.add("word_delete_selection")
         if any(term in normalized for term in ("email", "gmail", "mail", "inbox")):
             names.update({"gmail_unread", "gmail_read_message", "gmail_search", "gmail_compose", "gmail_send_current", "google_workspace_feature"})
-        if any(term in normalized for term in ("calendar", "meeting", "event", "schedule")):
+        reminder_intent = any(term in normalized for term in ("remind me", "reminder", "alert me", "set a reminder"))
+        if any(term in normalized for term in ("timer", "countdown")):
+            names.update({"timer_set", "timer_list", "timer_cancel"})
+        if reminder_intent:
+            names.update({"timer_set", "timer_list", "timer_cancel", "reminder_schedule", "reminder_list", "reminder_cancel"})
+        if any(term in normalized for term in ("calendar", "meeting", "event")) or (
+            "schedule" in normalized and not reminder_intent
+        ):
             names.update({"calendar_upcoming", "calendar_search", "calendar_create_event", "google_workspace_feature"})
         if any(term in normalized for term in ("drive", "document", "google docs", "spreadsheet", "sheet", "slides", "classroom", "contact", "task")):
             names.add("google_workspace_feature")
@@ -310,6 +320,9 @@ class SemanticCommandRouter:
             ("Mute the system; silence audio; unmute sound", "audio_mute"),
             ("Disable the Wi-Fi adapter; turn Wi-Fi off; enable Wi-Fi", "wifi_set"),
             ("Set a timer; remind me in five minutes; start a countdown", "timer_set"),
+            ("Remind me tomorrow at 9 AM; remind me to call Alex next Monday at 9 AM; schedule a reminder for a date and time", "reminder_schedule"),
+            ("Show my reminders; list upcoming reminders; what reminders do I have", "reminder_list"),
+            ("Cancel reminder number three; delete reminder ID 3", "reminder_cancel"),
             ("Read my unread emails; check unread Gmail", "gmail_unread"),
             ("Search my inbox; find messages from my professor", "gmail_search"),
             ("Do I have meetings; check my calendar; what is my next event", "calendar_upcoming"),
@@ -365,7 +378,22 @@ class SemanticCommandRouter:
                 raise ValueError("YouTube result number must be between 1 and 20.")
         if name == "timer_set":
             cleaned["seconds"] = int(cleaned.get("seconds", 0))
-            cleaned["label"] = str(cleaned.get("label", "Reminder"))
+            cleaned["label"] = str(cleaned.get("label", "Timer"))
+            if not 1 <= cleaned["seconds"] <= 604800:
+                raise ValueError("Timer duration must be between 1 second and 7 days.")
+        if name == "reminder_schedule":
+            cleaned["due_at"] = str(cleaned.get("due_at", "")).strip()
+            if not cleaned["due_at"]:
+                raise ValueError("A reminder date and time are required.")
+            cleaned["label"] = str(cleaned.get("label", "Reminder"))[:100]
+            cleaned["timezone_name"] = str(cleaned.get("timezone_name", os.getenv("VISIONGUIDE_TIMEZONE", "Asia/Kolkata")))
+            cleaned["recurrence"] = str(cleaned.get("recurrence", "none")).casefold()
+            if cleaned["recurrence"] not in {"none", "daily", "weekly", "weekdays"}:
+                raise ValueError("Reminder recurrence must be none, daily, weekly, or weekdays.")
+        if name in {"reminder_cancel", "timer_cancel"}:
+            cleaned["id"] = int(cleaned.get("id", 0))
+            if cleaned["id"] < 1:
+                raise ValueError("The schedule ID must be a positive integer.")
         if name in {"gmail_unread", "gmail_search", "calendar_upcoming", "calendar_search"}:
             for key in ("limit", "days"):
                 if key in cleaned:
@@ -715,16 +743,29 @@ class SemanticCommandRouter:
                 return RoutedCommand("wifi_set", {"enabled": False, "adapter": "Wi-Fi"}, "local-pattern", 0.8)
             if any(x in normalized for x in ("enable", "connect")) or re.search(r"\bon\b", normalized):
                 return RoutedCommand("wifi_set", {"enabled": True, "adapter": "Wi-Fi"}, "local-pattern", 0.8)
+        if any(term in normalized for term in ("show my reminders", "list reminders", "show reminders", "upcoming reminders", "what reminders do i have", "my reminders")):
+            return RoutedCommand("reminder_list", {}, "local-pattern", 0.96)
+        if any(term in normalized for term in ("cancel reminder", "delete reminder", "remove reminder")):
+            reminder_id = re.search(r"\b(?:reminder\s*)?(?:number|id)?\s*(\d+)\b", normalized)
+            if reminder_id:
+                return RoutedCommand("reminder_cancel", {"id": int(reminder_id.group(1))}, "local-pattern", 0.96)
         if any(term in normalized for term in ("cancel timer", "cancel the timer", "stop timer")):
             timer_id = re.search(r"\b(?:timer\s*)?(?:number|id)?\s*(\d+)\b", normalized)
             if timer_id:
                 return RoutedCommand("timer_cancel", {"id": int(timer_id.group(1))}, "local-pattern", 0.8)
-        if duration and any(term in normalized for term in ("timer", "remind me", "countdown", "alert me in")):
+        # Relative countdowns stay on the existing timer path. Calendar-date
+        # reminders are parsed separately and stored as persistent reminders.
+        if duration and any(term in normalized for term in ("timer", "remind me", "countdown", "alert me in")) and re.search(r"\b(?:in|for)\b", normalized):
             label = "Reminder"
             match = re.search(r"(?:timer|remind me|alert me)(?:\s+(?:for|to|in))?\s+(.+)$", text, re.I)
             if match:
                 label = match.group(0).strip().capitalize()[:100]
-            return RoutedCommand("timer_set", {"seconds": duration, "label": label}, "local-pattern", 0.8)
+            return RoutedCommand("timer_set", {"seconds": duration, "label": label}, "local-pattern", 0.9)
+        reminder_args = self._parse_reminder_request(text)
+        if reminder_args is not None:
+            return RoutedCommand("reminder_schedule", reminder_args, "local-pattern", 0.96)
+        if duration and any(term in normalized for term in ("timer", "countdown")):
+            return RoutedCommand("timer_set", {"seconds": duration, "label": "Timer"}, "local-pattern", 0.85)
         if any(term in normalized for term in ("send this email", "send email", "send the email", "send it")):
             return RoutedCommand("gmail_send_current", {}, "local-pattern", 0.8)
         if any(term in normalized for term in ("send whatsapp message", "send the whatsapp message", "send this whatsapp message")):
@@ -779,6 +820,121 @@ class SemanticCommandRouter:
         return None
 
     @staticmethod
+    def _parse_reminder_request(
+        text: str,
+        *,
+        now: datetime | None = None,
+        timezone_name: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Parse common spoken reminder phrases into scheduler arguments.
+
+        Supports today/tomorrow, named weekdays, daily/weekly/weekdays repeats,
+        and explicit 12-hour or 24-hour clock times. More unusual date formats
+        are left to the Groq function router rather than guessed locally.
+        """
+        source = " ".join(str(text or "").split()).strip()
+        lowered = source.casefold()
+        trigger = re.search(
+            r"\b(?:remind me|alert me|set (?:a )?reminder|create (?:a )?reminder|schedule (?:a )?reminder)\b",
+            lowered,
+        )
+        if not trigger:
+            return None
+        # Do not turn relative countdowns into calendar reminders.
+        if re.search(r"\b(?:in|for)\s+(?:\d+|one|a|an|two|three|four|five|ten|fifteen|twenty|thirty)\s+(?:seconds?|secs?|minutes?|mins?|hours?|hrs?)\b", lowered):
+            return None
+
+        timezone_name = (timezone_name or os.getenv("VISIONGUIDE_TIMEZONE", "Asia/Kolkata")).strip() or "Asia/Kolkata"
+        try:
+            zone = ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError:
+            return None
+        current = now or datetime.now(zone)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=zone)
+        else:
+            current = current.astimezone(zone)
+
+        ampm = re.search(r"\b(?:at\s*)?(\d{1,2})(?::([0-5]\d))?\s*([ap])\.?m\.?\b", lowered)
+        clock24 = None if ampm else re.search(r"\bat\s+([01]?\d|2[0-3]):([0-5]\d)\b", lowered)
+        if ampm:
+            hour = int(ampm.group(1))
+            minute = int(ampm.group(2) or 0)
+            if not 1 <= hour <= 12:
+                return None
+            hour = hour % 12 + (12 if ampm.group(3) == "p" else 0)
+        elif clock24:
+            hour, minute = int(clock24.group(1)), int(clock24.group(2))
+        else:
+            return None
+        clock = datetime_time(hour, minute)
+
+        weekdays = {
+            "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+            "friday": 4, "saturday": 5, "sunday": 6,
+        }
+        weekday_names = "|".join(weekdays)
+        repeat_day = re.search(rf"\bevery\s+({weekday_names})\b", lowered)
+        repeat_weekdays = bool(re.search(r"\bevery\s+weekdays?\b|\bweekdays\b", lowered))
+        repeat_daily = bool(re.search(r"\b(?:every day|everyday|daily)\b", lowered))
+        repeat_weekly = bool(re.search(r"\b(?:every week|weekly)\b", lowered))
+        recurrence = "weekdays" if repeat_weekdays else "daily" if repeat_daily else "weekly" if (repeat_day or repeat_weekly) else "none"
+
+        today = current.date()
+        if recurrence == "weekdays":
+            due_date = today
+            while due_date.weekday() >= 5 or datetime.combine(due_date, clock, zone) <= current:
+                due_date += timedelta(days=1)
+        elif recurrence == "daily":
+            due_date = today
+            if datetime.combine(due_date, clock, zone) <= current:
+                due_date += timedelta(days=1)
+        elif recurrence == "weekly":
+            target_day = weekdays[repeat_day.group(1)] if repeat_day else current.weekday()
+            days_ahead = (target_day - current.weekday()) % 7
+            due_date = today + timedelta(days=days_ahead)
+            if datetime.combine(due_date, clock, zone) <= current:
+                due_date += timedelta(days=7)
+        elif re.search(r"\btomorrow\b", lowered):
+            due_date = today + timedelta(days=1)
+        elif re.search(r"\btoday\b", lowered):
+            due_date = today
+        else:
+            named_day = re.search(rf"\b(?:next\s+)?({weekday_names})\b", lowered)
+            if not named_day:
+                return None
+            target_day = weekdays[named_day.group(1)]
+            days_ahead = (target_day - current.weekday()) % 7
+            due_date = today + timedelta(days=days_ahead)
+            if datetime.combine(due_date, clock, zone) <= current or ("next " in lowered and days_ahead == 0):
+                due_date += timedelta(days=7)
+
+        due_local = datetime.combine(due_date, clock, zone)
+        if due_local <= current:
+            return None
+
+        # Extract the human task from the utterance for the notification label.
+        label = re.sub(
+            r"^(?:please\s+)?(?:remind me|alert me|set (?:a )?reminder|create (?:a )?reminder|schedule (?:a )?reminder)\s*(?:to\s+)?",
+            "", source, flags=re.I,
+        )
+        label = re.sub(rf"\bevery\s+(?:{weekday_names}|weekdays?|day|week)\b|\b(?:daily|weekly|weekdays)\b", "", label, flags=re.I)
+        label = re.sub(rf"\b(?:tomorrow|today|next\s+)?(?:{weekday_names})\b", "", label, flags=re.I)
+        label = re.sub(r"\b(?:tomorrow|today)\b", "", label, flags=re.I)
+        label = re.sub(r"\b(?:at\s*)?\d{1,2}(?::\d{2})?\s*(?:[ap]\.?)?m?\b", "", label, flags=re.I)
+        label = re.sub(r"\b(?:at|on|around)\b", " ", label, flags=re.I)
+        label = re.sub(r"\s+", " ", label).strip(" .,!?:;- ")
+        label = re.sub(r"^(?:to|about|for)\b\s*", "", label, flags=re.I).strip()
+        if not label:
+            label = "Reminder"
+        return {
+            "due_at": due_local.isoformat(timespec="minutes"),
+            "label": label[:100],
+            "timezone_name": timezone_name,
+            "recurrence": recurrence,
+        }
+
+    @staticmethod
     def _parse_duration(text: str) -> int | None:
         value = text.casefold()
         total = 0
@@ -815,6 +971,11 @@ class SemanticCommandRouter:
             return {"enabled": not any(x in lower for x in ("turn off", "disable", "disconnect")), "adapter": "Wi-Fi"}
         if action == "timer_set":
             return {"seconds": SemanticCommandRouter._parse_duration(text) or 60, "label": "Voice timer"}
+        if action == "reminder_schedule":
+            return SemanticCommandRouter._parse_reminder_request(text) or {}
+        if action == "reminder_cancel":
+            match = re.search(r"\b(?:reminder\s*)?(?:number|id)?\s*(\d+)\b", lower)
+            return {"id": int(match.group(1))} if match else {}
         if action == "media_playback":
             key = next((x for x in ("pause", "stop", "next", "previous", "forward", "back", "play") if x in lower), "toggle")
             return {"action": key, "seconds": SemanticCommandRouter._parse_duration(text) or 10}

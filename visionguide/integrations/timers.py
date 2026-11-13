@@ -14,7 +14,7 @@ from typing import Callable, Iterator, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-Recurrence = Literal["none", "daily", "weekly"]
+Recurrence = Literal["none", "daily", "weekly", "weekdays"]
 _CHANNELS = ("desktop", "api")
 _POLL_INTERVAL_SECONDS = 0.5
 _CLAIM_LEASE_SECONDS = 30
@@ -108,6 +108,7 @@ class TimerManager:
                     timezone_name TEXT NOT NULL DEFAULT 'UTC',
                     recurrence TEXT NOT NULL DEFAULT 'none'
                         CHECK (recurrence IN ('none', 'daily', 'weekly')),
+                    weekdays_only INTEGER NOT NULL DEFAULT 0,
                     duration_seconds INTEGER,
                     status TEXT NOT NULL DEFAULT 'pending'
                         CHECK (status IN ('pending', 'completed', 'cancelled'))
@@ -129,6 +130,12 @@ class TimerManager:
                     ON schedule_deliveries(channel, delivered_at, claimed_at);
                 """
             )
+            # Additive migration for databases created by earlier scheduler builds.
+            columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(schedules)")}
+            if "weekdays_only" not in columns:
+                connection.execute(
+                    "ALTER TABLE schedules ADD COLUMN weekdays_only INTEGER NOT NULL DEFAULT 0"
+                )
 
     @staticmethod
     def _utc_now() -> datetime:
@@ -185,23 +192,26 @@ class TimerManager:
         duration_seconds: int | None,
     ) -> TimerRecord:
         label = self._validate_label(label)
-        if recurrence not in {"none", "daily", "weekly"}:
-            raise ValueError("recurrence must be 'none', 'daily', or 'weekly'.")
+        if recurrence not in {"none", "daily", "weekly", "weekdays"}:
+            raise ValueError("recurrence must be 'none', 'daily', 'weekly', or 'weekdays'.")
+        weekdays_only = recurrence == "weekdays"
+        stored_recurrence = "daily" if weekdays_only else recurrence
         if due_at <= self._utc_now():
             raise ValueError("The scheduled date and time must be in the future.")
         with self._connection() as connection:
             cursor = connection.execute(
                 """INSERT INTO schedules
                    (label, kind, scheduled_at, created_at, timezone_name, recurrence,
-                    duration_seconds, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')""",
+                    weekdays_only, duration_seconds, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')""",
                 (
                     label,
                     kind,
                     self._iso_utc(due_at),
                     self._iso_utc(self._utc_now()),
                     timezone_name,
-                    recurrence,
+                    stored_recurrence,
+                    1 if weekdays_only else 0,
                     duration_seconds,
                 ),
             )
@@ -232,12 +242,21 @@ class TimerManager:
         timezone_name: str = "Asia/Kolkata",
         recurrence: Recurrence = "none",
     ) -> TimerRecord:
-        """Schedule a one-time, daily, or weekly reminder.
+        """Schedule a one-time, daily, weekly, or weekday-only reminder.
 
         A naive ISO date-time is interpreted in ``timezone_name``. An aware
         date-time keeps its supplied offset and is normalized to UTC.
         """
+        if recurrence not in {"none", "daily", "weekly", "weekdays"}:
+            raise ValueError("recurrence must be 'none', 'daily', 'weekly', or 'weekdays'.")
         parsed = self._parse_due_at(due_at, timezone_name)
+        if recurrence == "weekdays":
+            zone = ZoneInfo(timezone_name)
+            local_due = parsed.astimezone(zone)
+            now_local = self._utc_now().astimezone(zone)
+            while local_due.weekday() >= 5 or local_due <= now_local:
+                local_due += timedelta(days=1)
+            parsed = local_due.astimezone(timezone.utc)
         return self._insert_schedule(
             label=label,
             kind="reminder",
@@ -275,12 +294,16 @@ class TimerManager:
                 else:
                     zone = ZoneInfo(str(row["timezone_name"]))
                     local_due = datetime.fromisoformat(occurrence_at).astimezone(zone)
+                    weekdays_only = bool(row["weekdays_only"]) if "weekdays_only" in row.keys() else False
                     increment = timedelta(days=1 if recurrence == "daily" else 7)
                     next_due = local_due + increment
                     # When the machine was off for several cycles, announce one
                     # missed occurrence, then move directly to the next future one.
-                    while next_due.astimezone(timezone.utc) <= now:
-                        next_due += increment
+                    while (
+                        next_due.astimezone(timezone.utc) <= now
+                        or (weekdays_only and next_due.weekday() >= 5)
+                    ):
+                        next_due += timedelta(days=1) if weekdays_only else increment
                     connection.execute(
                         "UPDATE schedules SET scheduled_at = ? WHERE id = ?",
                         (self._iso_utc(next_due), int(row["id"])),
@@ -393,6 +416,16 @@ class TimerManager:
             )
             return cursor.rowcount == 1
 
+    def cancel_reminder(self, reminder_id: int) -> bool:
+        """Cancel only a pending reminder; countdown timers are left untouched."""
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """UPDATE schedules SET status = 'cancelled'
+                   WHERE id = ? AND kind = 'reminder' AND status = 'pending'""",
+                (int(reminder_id),),
+            )
+            return cursor.rowcount == 1
+
     def list_timers(self) -> list[dict[str, int | str]]:
         now = self._utc_now()
         with self._connection() as connection:
@@ -427,7 +460,10 @@ class TimerManager:
                 "kind": str(row["kind"]),
                 "due_at": str(row["scheduled_at"]),
                 "timezone_name": str(row["timezone_name"]),
-                "recurrence": str(row["recurrence"]),
+                "recurrence": (
+                    "weekdays" if ("weekdays_only" in row.keys() and bool(row["weekdays_only"]))
+                    else str(row["recurrence"])
+                ),
                 "status": str(row["status"]),
                 "remaining_seconds": max(0, int((due - now).total_seconds())),
             })

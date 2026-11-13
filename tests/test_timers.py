@@ -96,6 +96,25 @@ class PersistentTimerManagerTests(unittest.TestCase):
         time.sleep(1.2)
         self.assertEqual(events, [])
 
+    def test_weekday_recurrence_moves_weekend_start_to_monday(self):
+        manager = self.manager()
+        now = datetime.now(ZoneInfo("Asia/Kolkata"))
+        days_until_saturday = (5 - now.weekday()) % 7 or 7
+        saturday = now + timedelta(days=days_until_saturday)
+        due = saturday.replace(hour=9, minute=0, second=0, microsecond=0)
+        if due <= now:
+            due += timedelta(days=7)
+        record = manager.schedule_at(
+            due.replace(tzinfo=None).isoformat(),
+            "Weekday review",
+            timezone_name="Asia/Kolkata",
+            recurrence="weekdays",
+        )
+        listed = next(item for item in manager.list_schedules() if item["id"] == record.timer_id)
+        local_due = datetime.fromisoformat(listed["due_at"]).astimezone(ZoneInfo("Asia/Kolkata"))
+        self.assertEqual(listed["recurrence"], "weekdays")
+        self.assertEqual(local_due.weekday(), 0)
+
     def test_invalid_time_zone_and_past_time_are_rejected(self):
         manager = self.manager()
         with self.assertRaises(ValueError):

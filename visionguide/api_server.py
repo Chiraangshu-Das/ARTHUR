@@ -79,7 +79,7 @@ class ReminderRequest(BaseModel):
     due_at: str = Field(min_length=10, max_length=80)
     label: str = Field(default="Reminder", max_length=100)
     timezone_name: str = Field(default="Asia/Kolkata", min_length=1, max_length=80)
-    recurrence: Literal["none", "daily", "weekly"] = "none"
+    recurrence: Literal["none", "daily", "weekly", "weekdays"] = "none"
 
 
 class GmailDraftRequest(BaseModel):
@@ -315,7 +315,7 @@ def get_reminders(_: bool = Depends(_authorized_header)) -> dict[str, Any]:
 
 @app.delete("/api/v1/reminders/{reminder_id}")
 def delete_reminder(reminder_id: int, _: bool = Depends(_authorized_header)) -> dict[str, Any]:
-    return {"id": reminder_id, "cancelled": _timers.cancel(reminder_id)}
+    return {"id": reminder_id, "cancelled": _timers.cancel_reminder(reminder_id)}
 
 
 @app.post("/api/v1/workspace/gmail/drafts")
@@ -516,7 +516,7 @@ def execute_route(route: RoutedCommand, *, confirmed: bool = False) -> dict[str,
             reminders = [item for item in _timers.list_schedules() if item["kind"] == "reminder"]
             return {"status": "ok", "reminders": reminders}
         if action == "reminder_cancel":
-            cancelled = _timers.cancel(int(args.get("id", 0)))
+            cancelled = _timers.cancel_reminder(int(args.get("id", 0)))
             return {"status": "ok" if cancelled else "not_found", "cancelled": cancelled}
         if action == "gmail_unread":
             include_body = bool(args.get("include_body", False))

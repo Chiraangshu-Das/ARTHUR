@@ -126,7 +126,7 @@ class ArthurApp:
         self.last_safety_version = -1
         self.last_photo_path: Path | None = None
         self._async_messages: queue.Queue[tuple[str, object]] = queue.Queue()
-        self.timer_manager = TimerManager(lambda timer_id, label: self._async_messages.put(("timer_expired", (timer_id, label))))
+        self.timer_manager = TimerManager(lambda timer_id, label, kind: self._async_messages.put(("timer_expired", (timer_id, label, kind))))
         self._closed = False
 
         self.root = tk.Tk()
@@ -1258,10 +1258,17 @@ class ArthurApp:
                     self._say(message[:3200])
                     self.status_var.set("Google Workspace action complete")
                 elif action == "timer_expired":
-                    timer_id, label = result
-                    message = f"Timer {timer_id} finished: {label}."
+                    values = tuple(result) if isinstance(result, (tuple, list)) else (0, str(result), "timer")
+                    timer_id = int(values[0]) if values else 0
+                    label = str(values[1]) if len(values) > 1 else "Reminder"
+                    kind = str(values[2]) if len(values) > 2 else ("reminder" if label.casefold().startswith("reminder:") else "timer")
+                    if kind == "reminder":
+                        message = f"Reminder {timer_id} is due: {label}."
+                        self.status_var.set("Reminder due")
+                    else:
+                        message = f"Timer {timer_id} finished: {label}."
+                        self.status_var.set("Timer completed")
                     self._append_output(message)
-                    self.status_var.set("Timer completed")
                     self._say(message, priority=True)
                 elif action in {"voice", "wakevoice"}:
                     transcript = str(result).strip()
@@ -1791,7 +1798,8 @@ class ArthurApp:
 
         # These integrations execute through typed, permission-aware device/provider adapters.
         if action in {"media_playback", "brightness_set", "brightness_adjust", "volume_set", "volume_adjust", "audio_mute", "wifi_set", "wifi_status", "brightness_get", "volume_get",
-                      "timer_set", "timer_list", "timer_cancel", "gmail_unread", "gmail_search", "calendar_upcoming", "calendar_search",
+                      "timer_set", "timer_list", "timer_cancel", "reminder_schedule", "reminder_list", "reminder_cancel",
+                      "gmail_unread", "gmail_search", "calendar_upcoming", "calendar_search",
                       "calendar_create_event", "gmail_compose", "gmail_send_current", "gmail_read_message", "word_write",
                       "word_save_document", "word_replace_text", "word_delete_selection", "whatsapp_compose",
                       "whatsapp_send_current", "type_into_window"}:
@@ -1846,6 +1854,35 @@ class ArthurApp:
                     timer_id = int(args.get("id", 0))
                     cancelled = self.timer_manager.cancel(timer_id)
                     response = f"Timer {timer_id} cancelled." if cancelled else f"No active timer with ID {timer_id}."
+                    self._set_output(response); self._say(response)
+                elif action == "reminder_schedule":
+                    timezone_name = str(args.get("timezone_name", os.getenv("VISIONGUIDE_TIMEZONE", "Asia/Kolkata")))
+                    recurrence = str(args.get("recurrence", "none"))
+                    record = self.timer_manager.schedule_at(
+                        str(args.get("due_at", "")), str(args.get("label", "Reminder")),
+                        timezone_name=timezone_name, recurrence=recurrence,
+                    )
+                    due_text = datetime.fromisoformat(str(args.get("due_at"))).strftime("%A, %d %B %Y at %I:%M %p")
+                    repeat_text = "" if recurrence == "none" else f" Repeats {recurrence}."
+                    response = f"Reminder {record.timer_id} set for {due_text}: {record.label}.{repeat_text}"
+                    self._set_output(response); self._say(response)
+                elif action == "reminder_list":
+                    rows = [item for item in self.timer_manager.list_schedules() if item["kind"] == "reminder"]
+                    if not rows:
+                        response = "You have no pending reminders."
+                    else:
+                        entries = []
+                        for item in rows:
+                            due = datetime.fromisoformat(str(item["due_at"]))
+                            due_text = due.strftime("%a %d %b, %I:%M %p")
+                            repeat = "" if item["recurrence"] == "none" else f" ({item['recurrence']})"
+                            entries.append(f"{item['id']}: {item['label']} — {due_text}{repeat}")
+                        response = "Your pending reminders: " + "; ".join(entries)
+                    self._set_output(response); self._say(response[:1800])
+                elif action == "reminder_cancel":
+                    reminder_id = int(args.get("id", 0))
+                    cancelled = self.timer_manager.cancel_reminder(reminder_id)
+                    response = f"Reminder {reminder_id} cancelled." if cancelled else f"No pending reminder with ID {reminder_id}."
                     self._set_output(response); self._say(response)
                 elif action == "gmail_unread":
                     limit = int(args.get("limit", 10)); include_body = bool(args.get("include_body", False))
