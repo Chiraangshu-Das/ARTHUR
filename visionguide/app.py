@@ -590,13 +590,28 @@ class ArthurApp:
 
     @staticmethod
     def _parse_voice_confirmation(transcript: str) -> bool | None:
-        """Return True/False only for a clear spoken confirmation; otherwise fail closed."""
+        """Interpret a clear leading yes/no answer; ambiguous speech fails closed."""
         text = re.sub(r"[^a-z0-9' ]+", " ", str(transcript).casefold())
         text = " ".join(text.split())
-        if re.match(r"^(yes|yeah|yep|correct|confirm|confirmed|approve|approved|go ahead|do it|send it|proceed|okay|ok)(?:\b|$)", text):
+        # Whisper can include the wake name even though confirmation is not a
+        # wake-word command. Remove only an opening form of address.
+        text = re.sub(r"^(?:(?:hey|hello)\s+)?arthur\b[ ,:.-]*", "", text).strip()
+        # A direct first-person approval is itself an unambiguous answer.
+        if re.match(r"^(?:i confirm|i approve|i agree)(?:\b|$)", text):
             return True
-        if re.match(r"^(no|nope|cancel|cancel it|don't|do not|stop|not now|decline)(?:\b|$)", text):
+        # Accept natural but unambiguous framing without treating phrases such
+        # as "I think yes" or "maybe yes" as an actual approval.
+        text = re.sub(
+            r"^(?:the answer is|my answer is|i said|i say|that is|that's|it is|it's)(?:\s+|$)",
+            "",
+            text,
+        )
+        no = r"^(?:no|nope|negative|absolutely not|definitely not|cancel(?: it)?|don't|do not|stop|not now|decline(?:d)?|never mind)(?:\b|$)"
+        yes = r"^(?:yes|yeah|yep|yup|sure|certainly|absolutely|definitely|correct|affirmative|confirm(?:ed)?|approve(?:d)?|go ahead|do it|send it|proceed|of course|okay|ok)(?:\b|$)"
+        if re.match(no, text):
             return False
+        if re.match(yes, text):
+            return True
         return None
 
     def _ask_yes_no(self, title: str, message: str, parent=None) -> bool:
@@ -648,26 +663,39 @@ class ArthurApp:
             play_confirmation_tone()
             # Let the short cue leave the physical speaker before opening the mic.
             time.sleep(0.25)
-            return record_and_transcribe(duration_seconds=6.0, model_name="base")
+            return record_and_transcribe(
+                duration_seconds=6.0,
+                model_name="base",
+                confirmation=True,
+            )
 
         decision = None
-        try:
-            for attempt in range(2):
-                self.status_var.set("Waiting for yes/no confirmation…")
+        capture_errors: list[str] = []
+        for attempt in range(2):
+            self.status_var.set(f"Waiting for yes/no confirmation… ({attempt + 1}/2)")
+            try:
                 response = capture_answer()
-                decision = self._parse_voice_confirmation(response)
-                if decision is not None:
-                    break
-                if attempt == 0:
-                    self._say("I did not catch a clear answer. Please say yes or no after I finish speaking.", interruptible=False)
-                    if not self.speech.wait_until_idle(timeout=12.0):
-                        self.speech.cancel()
-                        if not self.speech.wait_until_idle(timeout=3.0):
-                            raise RuntimeError("The retry prompt could not be stopped; confirmation recording was not opened.")
-                    time.sleep(drain_seconds)
-        except Exception as exc:
-            self._append_output(f"Voice confirmation capture failed: {exc}")
-            decision = None
+            except Exception as exc:
+                capture_errors.append(str(exc))
+                self._append_output(f"Voice confirmation attempt {attempt + 1} failed: {exc}")
+                response = ""
+            decision = self._parse_voice_confirmation(response)
+            if decision is not None:
+                break
+            if attempt == 0:
+                self._say(
+                    "I did not catch a clear yes or no. Please speak clearly after the tone.",
+                    interruptible=False,
+                )
+                if not self.speech.wait_until_idle(timeout=12.0):
+                    self.speech.cancel()
+                    if not self.speech.wait_until_idle(timeout=3.0):
+                        self._append_output(
+                            "The retry prompt could not be stopped safely. The requested action was not executed."
+                        )
+                        self.status_var.set("Confirmation unavailable · action not executed")
+                        return False
+                time.sleep(drain_seconds)
 
         if decision is True:
             self._append_output("Voice confirmation received: yes.")
@@ -679,7 +707,9 @@ class ArthurApp:
             self._say("Cancelled.", interruptible=False)
             return False
 
-        self._append_output("No clear yes/no confirmation was transcribed after two attempts. Action cancelled safely.")
+        self._append_output("No clear yes/no confirmation was received after two attempts. Action cancelled safely.")
+        if capture_errors:
+            self._append_output("Confirmation audio diagnostics: " + " | ".join(capture_errors))
         self.status_var.set("Confirmation not understood · action cancelled")
         self._say("I could not confirm that safely, so I cancelled the action.", interruptible=False)
         return False

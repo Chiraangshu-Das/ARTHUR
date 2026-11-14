@@ -100,27 +100,37 @@ def set_brightness(level: int) -> str:
     return f"Requested display brightness {level} percent. Provider result: {result!s}."
 
 
+
 def _with_audio_endpoint(operation):
-    """Run a pycaw operation with balanced COM initialization on the current thread."""
+    """Run a pycaw endpoint-volume operation with balanced COM initialization."""
     _require_windows("OS audio control")
+
     try:
-        from ctypes import POINTER, cast
-        from comtypes import CLSCTX_ALL, CoInitialize, CoUninitialize
-        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+        from comtypes import CoInitialize, CoUninitialize
+        from pycaw.pycaw import AudioUtilities
     except ImportError as exc:
-        raise RuntimeError("Audio controls require pycaw and comtypes. Install requirements-integrations.txt.") from exc
+        raise RuntimeError(
+            "Audio controls require pycaw and comtypes. "
+            "Install requirements-integrations.txt."
+        ) from exc
+
     initialized = False
     try:
         CoInitialize()
         initialized = True
+
         device = AudioUtilities.GetSpeakers()
-        interface = device.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-        endpoint = cast(interface, POINTER(IAudioEndpointVolume))
+        endpoint = device.EndpointVolume
+
         return operation(endpoint)
+
     except Exception as exc:
         if isinstance(exc, RuntimeError):
             raise
-        raise RuntimeError(f"Windows audio endpoint operation failed: {exc}") from exc
+        raise RuntimeError(
+            f"Windows audio endpoint operation failed: {exc}"
+        ) from exc
+
     finally:
         if initialized:
             try:

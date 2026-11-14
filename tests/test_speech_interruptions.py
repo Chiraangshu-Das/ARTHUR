@@ -68,17 +68,26 @@ class SpeechRenderingTests(unittest.TestCase):
 
 class VoiceConfirmationParsingTests(unittest.TestCase):
     def test_clear_yes_answers_are_accepted(self):
-        for phrase in ("yes", "yeah", "yep", "confirm", "go ahead", "okay"):
+        for phrase in (
+            "yes", "yeah", "yep", "yup", "sure", "confirm", "go ahead", "okay",
+            "Arthur, yes", "Hey Arthur, yeah", "Yes, go ahead", "Yes, I confirm this action",
+            "The answer is yes", "I said yes", "I confirm", "of course", "absolutely",
+        ):
             with self.subTest(phrase=phrase):
                 self.assertIs(ArthurApp._parse_voice_confirmation(phrase), True)
 
     def test_clear_no_answers_are_rejected(self):
-        for phrase in ("no", "nope", "cancel", "not now", "decline"):
+        for phrase in (
+            "no", "nope", "cancel", "not now", "decline", "Arthur, no",
+            "Hey Arthur, cancel it", "No, do not send it", "I said no", "absolutely not",
+        ):
             with self.subTest(phrase=phrase):
                 self.assertIs(ArthurApp._parse_voice_confirmation(phrase), False)
 
     def test_ambiguous_or_empty_answers_fail_closed(self):
-        for phrase in ("maybe", "I think so", "", "the answer is not obvious"):
+        for phrase in (
+            "maybe", "I think so", "I think yes", "maybe yes", "", "the answer is not obvious",
+        ):
             with self.subTest(phrase=phrase):
                 self.assertIsNone(ArthurApp._parse_voice_confirmation(phrase))
 
@@ -161,6 +170,7 @@ class VoiceConfirmationCaptureSafetyTests(unittest.TestCase):
 
         def fake_record(**kwargs):
             self.assertEqual(kwargs["duration_seconds"], 6.0)
+            self.assertTrue(kwargs["confirmation"], "confirmation must use the validated capture path")
             self.assertFalse(app.speech.is_busy, "raw microphone must open only after SAPI is idle")
             self.assertIsNone(app._aec_audio, "AEC input must be closed before sounddevice opens")
             self.assertTrue(aec.stopped)
@@ -174,6 +184,51 @@ class VoiceConfirmationCaptureSafetyTests(unittest.TestCase):
         self.assertTrue(app.speech.cancelled)
         self.assertGreaterEqual(app.speech.wait_calls, 2)
 
+
+    def test_confirmation_retries_after_a_microphone_capture_error(self):
+        import queue
+
+        class FakeSpeech:
+            def __init__(self):
+                self.is_busy = False
+
+            def cancel(self):
+                self.is_busy = False
+
+            def wait_until_idle(self, timeout=None):
+                self.is_busy = False
+                return True
+
+        class FakeStatus:
+            def set(self, _value):
+                return None
+
+        app = object.__new__(ArthurApp)
+        app.conversation_active = True
+        app.speech = FakeSpeech()
+        app._aec_audio = None
+        app._async_messages = queue.Queue()
+        app.status_var = FakeStatus()
+        output = []
+        app._append_output = output.append
+        app._stop_speech_interrupt_listener = lambda: None
+        app._stop_echo_cancelled_capture = lambda: None
+
+        def fake_say(_text, **_kwargs):
+            app.speech.is_busy = True
+
+        app._say = fake_say
+
+        with patch(
+            "visionguide.voice_commands.record_and_transcribe",
+            side_effect=[RuntimeError("temporary PortAudio input error"), "yes"],
+        ) as record, patch("time.sleep"):
+            accepted = ArthurApp._ask_yes_no(app, "Test action", "Full details on screen")
+
+        self.assertTrue(accepted)
+        self.assertEqual(record.call_count, 2)
+        self.assertTrue(record.call_args.kwargs["confirmation"])
+        self.assertTrue(any("attempt 1 failed" in line for line in output))
 
     def test_active_tts_without_aec_never_opens_raw_microphone(self):
         import queue

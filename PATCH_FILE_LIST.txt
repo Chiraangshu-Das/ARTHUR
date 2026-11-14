@@ -1,5 +1,10 @@
-visionguide/audio_echo.py
- tests/test_audio_echo.py
-install_patch.ps1
-README_INSTALL.txt
-AEC_READINESS_CALIBRATION.md
+Modified:
+  visionguide/app.py
+  visionguide/voice_commands.py
+  tests/test_speech_interruptions.py
+  .env.example
+  AEC_AUDIO_FIX_GUIDE.md
+Added:
+  tests/test_confirmation_audio.py
+Installer:
+  install_patch.ps1

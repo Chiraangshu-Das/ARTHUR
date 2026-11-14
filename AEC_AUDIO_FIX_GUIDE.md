@@ -46,3 +46,23 @@ During the recording, play sound through the same output endpoint and speak into
 the microphone. Compare `microphone_raw.wav` with `microphone_aec.wav`. The AEC
 track should reduce the speaker playback while preserving your voice. The
 recordings can contain private audio; do not share the WAV files.
+
+
+## Confirmation microphone selection and diagnostics
+
+Voice confirmation uses the Windows default input device unless
+`VISIONGUIDE_CONFIRMATION_MIC_DEVICE` is set in `.env`. The value may be a
+numeric input-device index or an unambiguous device-name fragment. Inspect the
+available devices and default input with:
+
+```powershell
+python -c "import sounddevice as sd; print(sd.query_devices()); print('Default devices:', sd.default.device)"
+```
+
+The confirmation path checks that the selected endpoint has input channels and
+supports mono 16 kHz capture. It prints the selected device, captured RMS/peak
+levels, and Whisper transcript to the local terminal; it does not save the
+recording. A near-zero signal or device error is reported and the action remains
+unconfirmed. If the Windows default endpoint changes, restart ARTHUR and verify
+the device index again before setting an override. Do not select a virtual input
+that reports zero-level audio.
