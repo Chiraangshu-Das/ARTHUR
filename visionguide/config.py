@@ -1,6 +1,23 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+
+# Resolve the project root independently of the current working directory.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ENV_FILE = PROJECT_ROOT / ".env"
+
+
+def load_environment() -> None:
+    """
+    Load project environment variables.
+
+    The project's .env takes priority over existing OS environment variables.
+    If .env does not exist, existing OS environment variables remain usable.
+    """
+    load_dotenv(dotenv_path=ENV_FILE, override=True)
+
 
 @dataclass(frozen=True)
 class AppConfig:

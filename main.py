@@ -4,7 +4,9 @@ import argparse
 import os
 from pathlib import Path
 
-from dotenv import load_dotenv
+from visionguide.config import load_environment
+
+load_environment()
 
 from visionguide.app import ArthurApp
 from visionguide.engine import VisionWorker
@@ -27,7 +29,6 @@ def main() -> None:
     if args.fps < 1 or args.fps > 30:
         parser.error("--fps must be between 1 and 30")
 
-    load_dotenv()
     if args.serve_api:
         from visionguide.api_server import main as serve_api
         serve_api()

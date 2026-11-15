@@ -10,7 +10,10 @@ import tempfile
 from pathlib import Path
 from typing import Any, Literal
 
-from dotenv import load_dotenv
+from visionguide.config import load_environment
+
+load_environment()
+
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
@@ -31,8 +34,6 @@ from visionguide.integrations.system_controls import (
 from visionguide.integrations.timers import TimerManager
 from visionguide.semantic_router import RoutedCommand, SemanticCommandRouter
 from visionguide.voice_commands import transcribe_audio_file
-
-load_dotenv()
 
 app = FastAPI(title="Arthur Device Agent API", version="1.0.0")
 gemini = GroqAssistant()

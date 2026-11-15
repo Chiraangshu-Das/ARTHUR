@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+from visionguide.config import load_environment
 import base64
 import os
 
@@ -10,6 +10,8 @@ class GroqAssistant:
     """On-demand Groq text, function-routing companion, and vision Q&A client."""
 
     def __init__(self):
+        load_environment()
+        
         self.api_key = os.getenv("GROQ_API_KEY", "").strip()
         self.model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip() or "openai/gpt-oss-120b"
         self.vision_model = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b").strip() or "qwen/qwen3.8-27b"
