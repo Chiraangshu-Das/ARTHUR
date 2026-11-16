@@ -681,7 +681,15 @@ class SemanticCommandRouter:
             if literal:
                 return RoutedCommand("type_text", {"text": literal}, "local-pattern", 0.95)
 
-        if any(p in normalized for p in (
+        # Route all common activation verbs to ARTHUR's in-process keyboard.
+        # Do not let phrases such as "turn on the virtual keyboard" fall through
+        # to the generic open_app tool (which may try to launch Windows OSK).
+        if re.search(
+            r"\b(?:open|show|bring up|launch|display|turn on|switch on|enable|activate|start)\s+"
+            r"(?:the\s+)?(?:(?:arthur(?:'s)?|system|air)\s+)?"
+            r"(?:virtual|on[ -]?screen|air)\s+keyboard\b",
+            normalized,
+        ) or any(p in normalized for p in (
             "open the virtual keyboard", "open virtual keyboard", "show the virtual keyboard", "show virtual keyboard",
             "open air keyboard", "show air keyboard", "bring up the virtual keyboard", "bring up virtual keyboard",
             "launch the virtual keyboard", "launch virtual keyboard", "display the virtual keyboard",
@@ -689,7 +697,7 @@ class SemanticCommandRouter:
             "open the on-screen keyboard", "show on screen keyboard", "show on-screen keyboard",
             "show the on-screen keyboard", "bring up on-screen keyboard",
         )):
-            return RoutedCommand("keyboard_toggle", {"open": True}, "local-pattern", 0.95)
+            return RoutedCommand("keyboard_toggle", {"open": True}, "local-pattern", 0.99)
         if any(p in normalized for p in ("close the virtual keyboard", "hide the virtual keyboard", "close virtual keyboard", "hide virtual keyboard", "close air keyboard")):
             return RoutedCommand("keyboard_toggle", {"open": False}, "local-pattern", 0.95)
 

@@ -174,6 +174,9 @@ def test_voice_router_has_local_scene_face_bluetooth_and_keyboard_routes():
     assert router.route("Turn Bluetooth off").arguments == {"enabled": False}
     assert router.route("Open the on-screen keyboard").action == "keyboard_toggle"
     assert router.route("Bring up the virtual keyboard").action == "keyboard_toggle"
+    assert router.route("Turn on the virtual keyboard").action == "keyboard_toggle"
+    assert router.route("Enable Arthur's virtual keyboard").action == "keyboard_toggle"
+    assert router.route("Switch on the air keyboard").action == "keyboard_toggle"
 
 
 def test_calendar_create_reads_back_inserted_event_before_claiming_verified():
