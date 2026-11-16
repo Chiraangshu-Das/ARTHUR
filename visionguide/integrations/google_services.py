@@ -233,8 +233,19 @@ class GoogleMapsServices:
             payload = response.json()
         except requests.RequestException as exc:
             raise RuntimeError(f"Geocoding request failed: {exc}") from exc
-        if payload.get("status") != "OK" or not payload.get("results"):
-            raise RuntimeError(f"Could not resolve {address!r} (Geocoding status: {payload.get('status', 'unknown')}).")
+        status = str(payload.get("status", "unknown"))
+        if status != "OK" or not payload.get("results"):
+            provider_detail = str(payload.get("error_message", "")).strip()
+            if status == "REQUEST_DENIED":
+                guidance = " Check that the Geocoding API is enabled for this key, billing is active, and the key's API/application restrictions allow this request."
+            elif status == "OVER_QUERY_LIMIT":
+                guidance = " Check the Geocoding API quota and billing limits."
+            elif status == "ZERO_RESULTS":
+                guidance = " Try a more specific place name, city, or full address."
+            else:
+                guidance = " Check the address, Google Maps API configuration, and quota."
+            detail = f" Provider detail: {provider_detail}." if provider_detail else ""
+            raise RuntimeError(f"Could not resolve {address!r} (Geocoding status: {status}).{detail}{guidance}")
         point = payload["results"][0]["geometry"]["location"]
         coords = (float(point["lat"]), float(point["lng"]))
         self.cache.put(key, coords, 86400)

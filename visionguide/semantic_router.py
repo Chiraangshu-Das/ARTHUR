@@ -38,6 +38,7 @@ _FUNCTIONS: list[dict[str, Any]] = [
     {"name": "close_app", "description": "Gracefully close one explicitly named allowlisted desktop application window. The client must request confirmation first.", "parameters": {"type": "object", "properties": {"name": {"type": "string", "enum": ["word", "excel", "powerpoint", "notepad", "calculator", "file explorer", "chrome", "edge", "firefox", "vscode", "whatsapp", "autocad", "arduino", "terminal", "powershell", "command prompt", "paint", "snipping tool"]}}, "required": ["name"]}},
     {"name": "close_website", "description": "Close a named website's currently active browser tab after explicit confirmation. This does not terminate the browser process; background tabs are not selected automatically.", "parameters": {"type": "object", "properties": {"name": {"type": "string", "enum": ["youtube", "google", "github", "chatgpt", "gemini", "claude", "leetcode", "netlify", "render", "gmail", "google drive", "google docs", "google sheets", "google maps", "google meet", "google classroom", "stackoverflow", "wikipedia", "reddit", "linkedin", "instagram", "whatsapp web", "google cloud console", "neon", "coursera", "swayam", "nptel"]}}, "required": ["name"]}},
     {"name": "face_enroll", "description": "Start the local face-enrollment workflow after showing consent and asking the user to confirm that the person agrees to local biometric sample storage.", "parameters": {"type": "object", "properties": {}}},
+    {"name": "face_identify", "description": "Perform a one-shot local match of one visible face against consenting, locally enrolled profiles. Never infer identity without a confident enrolled match.", "parameters": {"type": "object", "properties": {}}},
     {"name": "face_recognition", "description": "Enable or disable local recognition of previously enrolled, consenting faces. Never enroll without consent.", "parameters": {"type": "object", "properties": {"enabled": {"type": "boolean"}}, "required": ["enabled"]}},
     {"name": "gesture_calibrate", "description": "Start the two-point calibration for the already enabled hand-pointer controller.", "parameters": {"type": "object", "properties": {}}},
     {"name": "describe", "description": "Use the current camera frame to describe the visible scene, only when the user asks. Never narrate spontaneously.", "parameters": {"type": "object", "properties": {}}},
@@ -53,6 +54,7 @@ _FUNCTIONS: list[dict[str, Any]] = [
     {"name": "open_latest_pdf", "description": "Open the most recently modified PDF in Downloads, Documents, or Desktop.", "parameters": {"type": "object", "properties": {}}},
     {"name": "internet_status", "description": "Check network reachability without sending user content.", "parameters": {"type": "object", "properties": {}}},
     {"name": "system_status", "description": "Report local operating system, RAM, disk, and available battery status.", "parameters": {"type": "object", "properties": {}}},
+    {"name": "current_datetime", "description": "Report the computer current local time, date, day, date and time, or local timezone. Use this for the user current local clock; use timezone_lookup only when a different location is named.", "parameters": {"type": "object", "properties": {"detail": {"type": "string", "enum": ["time", "date", "day", "datetime", "timezone"]}}}},
     {"name": "camera_stop", "description": "Stop camera capture and local detection immediately when explicitly requested by the user.", "parameters": {"type": "object", "properties": {}}},
     {"name": "camera_start", "description": "Turn on persistent camera capture until the user explicitly turns it off; do not narrate until asked.", "parameters": {"type": "object", "properties": {}}},
     {"name": "safety_on", "description": "Enable separately opt-in proactive safety alerts.", "parameters": {"type": "object", "properties": {}}},
@@ -69,9 +71,11 @@ _FUNCTIONS: list[dict[str, Any]] = [
     {"name": "volume_set", "description": "Set OS master output volume from 0 to 100 percent.", "parameters": {"type": "object", "properties": {"level": {"type": "integer", "minimum": 0, "maximum": 100}}, "required": ["level"]}},
     {"name": "volume_adjust", "description": "Increase or decrease current OS output volume by a relative percentage-point amount.", "parameters": {"type": "object", "properties": {"delta": {"type": "integer", "minimum": -50, "maximum": 50}}, "required": ["delta"]}},
     {"name": "volume_get", "description": "Report current OS master volume and mute state.", "parameters": {"type": "object", "properties": {}}},
-    {"name": "wifi_status", "description": "List current Windows network adapters and their connection states.", "parameters": {"type": "object", "properties": {}}},
+    {"name": "wifi_status", "description": "Report the current Windows Wi-Fi radio state.", "parameters": {"type": "object", "properties": {}}},
     {"name": "audio_mute", "description": "Mute or unmute system audio output.", "parameters": {"type": "object", "properties": {"muted": {"type": "boolean"}}, "required": ["muted"]}},
-    {"name": "wifi_set", "description": "Enable or disable a named Windows network adapter. This changes connectivity and requires user confirmation.", "parameters": {"type": "object", "properties": {"enabled": {"type": "boolean"}, "adapter": {"type": "string"}}, "required": ["enabled"]}},
+    {"name": "wifi_set", "description": "Turn the Windows Wi-Fi radio on or off using the Windows Radio API. This changes connectivity and requires user confirmation.", "parameters": {"type": "object", "properties": {"enabled": {"type": "boolean"}}, "required": ["enabled"]}},
+    {"name": "bluetooth_status", "description": "Report the current Windows Bluetooth radio state.", "parameters": {"type": "object", "properties": {}}},
+    {"name": "bluetooth_set", "description": "Turn the Windows Bluetooth radio on or off using the Windows Radio API. Requires user confirmation.", "parameters": {"type": "object", "properties": {"enabled": {"type": "boolean"}}, "required": ["enabled"]}},
     {"name": "timer_set", "description": "Create a countdown timer or background alert.", "parameters": {"type": "object", "properties": {"seconds": {"type": "integer", "minimum": 1, "maximum": 604800}, "label": {"type": "string"}}, "required": ["seconds"]}},
     {"name": "timer_list", "description": "List active countdown timers.", "parameters": {"type": "object", "properties": {}}},
     {"name": "reminder_schedule", "description": "Create a persistent one-time or recurring local reminder at a specific date and time. Use an ISO 8601 due_at value and the user's local timezone. Recurrence can be none, daily, weekly, or weekdays. Do not use this for countdowns such as 'in five minutes'; use timer_set for those.", "parameters": {"type": "object", "properties": {"due_at": {"type": "string", "description": "ISO 8601 date-time, including local offset when available"}, "label": {"type": "string"}, "timezone_name": {"type": "string"}, "recurrence": {"type": "string", "enum": ["none", "daily", "weekly", "weekdays"]}}, "required": ["due_at"]}},
@@ -80,7 +84,7 @@ _FUNCTIONS: list[dict[str, Any]] = [
     {"name": "gmail_unread", "description": "List unread Gmail messages or read their body text aloud. Set include_body true when the user asks to read unread emails; otherwise provide a summary list.", "parameters": {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 20}, "include_body": {"type": "boolean"}}}},
     {"name": "gmail_read_message", "description": "Read the full text content of one Gmail message by its known message ID.", "parameters": {"type": "object", "properties": {"message_id": {"type": "string"}}, "required": ["message_id"]}},
     {"name": "gmail_search", "description": "Search the authenticated Gmail inbox using a Gmail search query.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 50}}, "required": ["query"]}},
-    {"name": "calendar_upcoming", "description": "List upcoming primary-calendar events for the next number of days.", "parameters": {"type": "object", "properties": {"days": {"type": "integer", "minimum": 1, "maximum": 366}, "limit": {"type": "integer", "minimum": 1, "maximum": 50}}}},
+    {"name": "calendar_upcoming", "description": "List primary-calendar events across the next 30 days and a short recent lookback so newly created events are not missed.", "parameters": {"type": "object", "properties": {"days": {"type": "integer", "minimum": 1, "maximum": 366}, "limit": {"type": "integer", "minimum": 1, "maximum": 50}}}},
     {"name": "calendar_search", "description": "Search primary-calendar events by words in title/description.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "days": {"type": "integer", "minimum": 1, "maximum": 730}}, "required": ["query"]}},
     {"name": "calendar_create_event", "description": "Prepare a new calendar event. This modifies the user's calendar and requires explicit confirmation by the client before execution.", "parameters": {"type": "object", "properties": {"summary": {"type": "string"}, "start": {"type": "string", "description": "ISO 8601 date-time"}, "end": {"type": "string", "description": "ISO 8601 date-time"}, "timezone_name": {"type": "string"}, "location": {"type": "string"}, "description": {"type": "string"}}, "required": ["summary", "start", "end"]}},
     {"name": "google_workspace_feature", "description": "Run an explicitly requested, allowlisted Google Workspace/Generative Language API operation. Provide resource IDs and payload_json when needed. Any create/update/delete/send/publish action requires explicit user confirmation. Scopes are requested per feature and may require Google verification or administrator approval.", "parameters": {"type": "object", "properties": {"operation": {"type": "string", "enum": ["drive_search", "docs_read", "docs_create", "sheets_read", "sheets_update", "slides_read", "slides_create", "tasks_list", "tasks_create", "profile", "contacts_search", "classroom_courses", "classroom_coursework", "classroom_announcements", "meet_create", "youtube_search", "forms_read", "forms_create", "calendar_acl_create", "calendar_acl_delete", "calendar_acl_list", "calendar_acl_update", "calendar_create", "calendar_delete", "calendar_event_create", "calendar_event_delete", "calendar_event_get", "calendar_event_update", "calendar_events_list", "calendar_freebusy", "calendar_get", "calendar_list", "calendar_public_events", "calendar_setting_get", "calendar_settings_list", "calendar_subscribe", "calendar_unsubscribe", "calendar_update", "classroom_announcement_create", "classroom_announcement_delete", "classroom_announcement_update", "classroom_course_create", "classroom_course_delete", "classroom_course_get", "classroom_course_update", "classroom_coursework_create", "classroom_coursework_delete", "classroom_coursework_update", "classroom_guardian_create", "classroom_guardian_delete", "classroom_guardians_list", "classroom_guardians_me", "classroom_material_create", "classroom_material_delete", "classroom_material_update", "classroom_materials", "classroom_registration_create", "classroom_registration_delete", "classroom_student_add", "classroom_student_remove", "classroom_students_list", "classroom_submission_reclaim", "classroom_submission_return", "classroom_submission_turn_in", "classroom_submission_update", "classroom_submissions_list", "classroom_teacher_add", "classroom_teacher_remove", "classroom_teachers_list", "classroom_topic_create", "classroom_topic_delete", "classroom_topic_update", "classroom_topics", "docs_batch_update", "docs_insert_text", "docs_replace_text", "drive_about", "drive_activity_list", "drive_appdata_list", "drive_apps_list", "drive_file_copy", "drive_file_create", "drive_file_delete", "drive_file_get", "drive_file_update", "drive_files_list", "drive_meet_files_list", "drive_permission_create", "drive_permission_delete", "drive_permission_list", "drive_permission_update", "drive_photo_files_list", "drive_script_create", "drive_script_get", "drive_script_update", "forms_response_get", "forms_response_watch_create", "forms_response_watch_delete", "forms_responses_list", "forms_update", "generative_peruserquota_status", "generative_retriever_create", "generative_retriever_delete", "generative_retriever_get", "generative_retriever_list", "generative_retriever_query", "generative_tuned_model_get", "generative_tuned_models_list", "generative_tuning_delete", "gmail_autoforward_get", "gmail_autoforward_update", "gmail_delegate_create", "gmail_delegate_delete", "gmail_delegates_list", "gmail_draft_create", "gmail_draft_delete", "gmail_draft_read", "gmail_draft_send", "gmail_draft_update", "gmail_drafts_list", "gmail_filter_create", "gmail_filter_delete", "gmail_filters_list", "gmail_forwarding_create", "gmail_forwarding_delete", "gmail_forwarding_list", "gmail_label_create", "gmail_label_delete", "gmail_label_update", "gmail_labels_list", "gmail_message_delete", "gmail_message_insert", "gmail_message_modify", "gmail_message_read", "gmail_messages_list", "gmail_metadata_list", "gmail_notifications_watch", "gmail_send", "gmail_sendas_create", "gmail_sendas_delete", "gmail_sendas_list", "gmail_sendas_update", "gmail_setting_get", "gmail_settings_list", "meet_conference_records", "meet_end_conference", "meet_participants_list", "meet_recordings_list", "meet_space_create", "meet_space_get", "meet_space_update", "meet_transcripts_list", "people_contact_create", "people_contact_delete", "people_contact_update", "people_contacts_search", "people_other_contacts_list", "people_user_profile", "sheets_append", "sheets_batch_update", "sheets_clear", "sheets_create", "slides_batch_update", "tasks_complete", "tasks_delete", "tasks_reopen", "tasks_update", "youtube_channel", "youtube_comment_insert", "youtube_memberships", "youtube_my_videos", "youtube_playlist_create", "youtube_playlist_delete", "youtube_playlist_item_add", "youtube_playlist_item_delete", "youtube_playlist_list", "youtube_playlist_update", "youtube_upload", "youtube_video_delete", "youtube_video_update"]}, "query": {"type": "string"}, "identifier": {"type": "string"}, "title": {"type": "string"}, "subject": {"type": "string"}, "content": {"type": "string"}, "body": {"type": "string"}, "recipient": {"type": "string"}, "email": {"type": "string"}, "course_id": {"type": "string"}, "calendar_id": {"type": "string"}, "calendar_ids": {"type": "array", "items": {"type": "string"}}, "start_time": {"type": "string"}, "end_time": {"type": "string"}, "time_min": {"type": "string"}, "time_max": {"type": "string"}, "timezone": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}, "range_name": {"type": "string"}, "values_json": {"type": "string"}, "payload_json": {"type": "string"}, "due": {"type": "string"}, "format": {"type": "string", "enum": ["full", "metadata", "minimal"]}, "add_label_ids": {"type": "array", "items": {"type": "string"}}, "remove_label_ids": {"type": "array", "items": {"type": "string"}}, "rule_id": {"type": "string"}, "item_id": {"type": "string"}, "resource_id": {"type": "string"}, "submission_id": {"type": "string"}, "user_id": {"type": "string"}, "student_id": {"type": "string"}, "guardian_id": {"type": "string"}, "permission_id": {"type": "string"}, "send_notification": {"type": "boolean"}, "topic_name": {"type": "string"}, "file_path": {"type": "string"}, "mime_type": {"type": "string"}, "privacy": {"type": "string", "enum": ["private", "unlisted", "public"]}, "video_id": {"type": "string"}, "index": {"type": "integer", "minimum": 1, "maximum": 2000000}, "match_case": {"type": "boolean"}, "update_fields": {"type": "string"}, "update_mask": {"type": "string"}, "start_index": {"type": "integer", "minimum": 1}, "end_index": {"type": "integer", "minimum": 2}, "fields": {"type": "array", "items": {"type": "string"}}, "page_token": {"type": "string"}, "response_id": {"type": "string"}, "watch_id": {"type": "string"}, "parent": {"type": "string"}, "cloud_pubsub_topic": {"type": "string"}}, "required": ["operation"]}},
@@ -190,7 +194,7 @@ class SemanticCommandRouter:
             "open_website", "open_app", "close_app", "close_website", "youtube_search",
             "youtube_select_result", "web_search", "media_playback", "type_text",
             "type_into_window", "submit_typed_field", "word_write", "word_save_document", "word_replace_text",
-            "word_delete_selection", "draft_and_type", "focus_target", "general_query",
+            "word_delete_selection", "draft_and_type", "focus_target", "current_datetime", "general_query",
         }
         if "word" in normalized or "document" in normalized:
             if any(term in normalized for term in ("save", "store")):
@@ -206,6 +210,8 @@ class SemanticCommandRouter:
             names.update({"timer_set", "timer_list", "timer_cancel"})
         if reminder_intent:
             names.update({"timer_set", "timer_list", "timer_cancel", "reminder_schedule", "reminder_list", "reminder_cancel"})
+        if any(term in normalized for term in ("face", "recognize me", "recognise me", "who am i")):
+            names.update({"face_enroll", "face_identify", "face_recognition"})
         if any(term in normalized for term in ("calendar", "meeting", "event")) or (
             "schedule" in normalized and not reminder_intent
         ):
@@ -306,6 +312,7 @@ class SemanticCommandRouter:
         except ImportError:
             return None
         exemplars: list[tuple[str, str]] = [
+            ("What time is it; tell me the current time; what is today's date; what day is today; tell me the date and time; what timezone am I in", "current_datetime"),
             ("Open YouTube; take me to YouTube; put YouTube on screen; navigate to YouTube", "open_website"),
             ("Describe the scene in front of me; tell me what you see; what am I looking at; describe the camera view", "describe"),
             ("Is there a television; can you see a person; check whether a chair is present", "check_object"),
@@ -398,11 +405,9 @@ class SemanticCommandRouter:
             for key in ("limit", "days"):
                 if key in cleaned:
                     cleaned[key] = int(cleaned[key])
-        if name == "wifi_set":
+        if name in {"wifi_set", "bluetooth_set"}:
             if not isinstance(cleaned.get("enabled"), bool):
-                # Do not treat ambiguous strings as truthy.
-                raise ValueError("Wi-Fi enabled must be a boolean.")
-            cleaned["adapter"] = str(cleaned.get("adapter", "Wi-Fi"))
+                raise ValueError(f"{name.removesuffix('_set').replace('_', ' ').title()} enabled must be a boolean.")
         return cleaned
 
     @staticmethod
@@ -420,6 +425,28 @@ class SemanticCommandRouter:
         normalized = text.casefold().strip()
         percent = re.search(r"\b(\d{1,3})\s*(?:percent|per cent|%)", normalized)
 
+        # Location-specific time questions must remain timezone lookups, not local-clock answers.
+        remote_time = re.search(
+            r"\b(?:what\s+time\s+is\s+it|what(?:'s|\s+is)\s+the\s+time|current\s+time|local\s+time|time\s*zone|timezone)\s+(?:in|for|at)\s+(.+?)[?.!]*$",
+            normalized,
+        )
+        if remote_time:
+            location = remote_time.group(1).strip()
+            if location:
+                return RoutedCommand("google_maps_feature", {"operation": "timezone_lookup", "location": location}, "local-pattern", 0.96)
+
+        # Questions about this computer's clock are answered locally without Groq.
+        if re.search(r"\b(?:what\s+day\s+is\s+(?:it|today)|which\s+day\s+is\s+today|what\s+day\s+of\s+the\s+week\s+is\s+it|what\s+day\s+is\s+it\s+today)\b", normalized):
+            return RoutedCommand("current_datetime", {"detail": "day"}, "local-pattern", 0.99)
+        if re.search(r"\b(?:what\s+is\s+)?(?:today'?s\s+)?date\s+and\s+time\b|\bdate\s+and\s+time\s+right\s+now\b|\btell\s+me\s+the\s+date\s+and\s+time\b", normalized):
+            return RoutedCommand("current_datetime", {"detail": "datetime"}, "local-pattern", 0.99)
+        if re.search(r"\b(?:what\s+is\s+)?(?:today'?s\s+date|the\s+date\s+today)|\bwhat\s+is\s+the\s+date\b|\bcurrent\s+date\b|\btell\s+me\s+(?:the\s+)?date\b", normalized):
+            return RoutedCommand("current_datetime", {"detail": "date"}, "local-pattern", 0.99)
+        if re.search(r"\b(?:what\s+time\s+is\s+it|what(?:'s|\s+is)\s+the\s+(?:current\s+)?time|current\s+time|tell\s+me\s+(?:the\s+)?time|what\s+is\s+my\s+local\s+time)\b", normalized):
+            return RoutedCommand("current_datetime", {"detail": "time"}, "local-pattern", 0.99)
+        if re.search(r"\b(?:what(?:'s|\s+is)\s+my\s+time\s*zone|what\s+time\s*zone\s+am\s+i\s+in|my\s+time\s*zone|tell\s+me\s+my\s+time\s*zone|what\s+timezone\s+am\s+i\s+in)\b", normalized):
+            return RoutedCommand("current_datetime", {"detail": "timezone"}, "local-pattern", 0.99)
+
         # Local controls should not depend on a Groq request or the embedding model.
         if re.search(r"\b(?:turn|switch|start|enable)\b.*\bcamera\b.*\bon\b|\b(?:turn on|switch on|start|enable) (?:the )?(?:web )?camera\b|\bopen camera\b", normalized):
             return RoutedCommand("camera_start", {}, "local-pattern", 0.99)
@@ -428,10 +455,28 @@ class SemanticCommandRouter:
 
         if any(term in normalized for term in ("enroll my face", "enrol my face", "remember my face", "register my face", "enroll face", "enrol face", "register face")):
             return RoutedCommand("face_enroll", {}, "local-pattern", 0.99)
+        if any(term in normalized for term in (
+            "do you recognize me", "do you recognise me", "do you know me", "who am i",
+            "who is in front of you", "who is standing in front of you", "can you identify me",
+        )):
+            return RoutedCommand("face_identify", {}, "local-pattern", 0.99)
         if any(term in normalized for term in ("recognize my face", "recognise my face", "turn on face recognition", "enable face recognition", "start face recognition")):
             return RoutedCommand("face_recognition", {"enabled": True}, "local-pattern", 0.98)
         if any(term in normalized for term in ("turn off face recognition", "disable face recognition", "stop face recognition")):
             return RoutedCommand("face_recognition", {"enabled": False}, "local-pattern", 0.98)
+
+        if any(term in normalized for term in (
+            "describe the scene", "describe the surroundings", "describe what is in front of me",
+            "what do you see in front of me", "what is in front of me", "what is around me",
+            "tell me what you see", "describe the camera view", "what am i looking at",
+        )):
+            return RoutedCommand("describe", {}, "local-pattern", 0.97)
+        if any(term in normalized for term in (
+            "what is this product", "what product is this", "identify this product",
+            "tell me about this product", "what is this object", "what is this device",
+            "what am i holding", "identify the item in front of me", "look up this product",
+        )):
+            return RoutedCommand("product_lookup", {"query": text}, "local-pattern", 0.96)
 
         if "calibrate" in normalized and any(term in normalized for term in ("gesture", "finger", "hand pointer", "air mouse")):
             return RoutedCommand("gesture_calibrate", {}, "local-pattern", 0.98)
@@ -636,7 +681,14 @@ class SemanticCommandRouter:
             if literal:
                 return RoutedCommand("type_text", {"text": literal}, "local-pattern", 0.95)
 
-        if any(p in normalized for p in ("open the virtual keyboard", "open virtual keyboard", "show the virtual keyboard", "show virtual keyboard", "open air keyboard", "show air keyboard")):
+        if any(p in normalized for p in (
+            "open the virtual keyboard", "open virtual keyboard", "show the virtual keyboard", "show virtual keyboard",
+            "open air keyboard", "show air keyboard", "bring up the virtual keyboard", "bring up virtual keyboard",
+            "launch the virtual keyboard", "launch virtual keyboard", "display the virtual keyboard",
+            "display virtual keyboard", "open on screen keyboard", "open on-screen keyboard",
+            "open the on-screen keyboard", "show on screen keyboard", "show on-screen keyboard",
+            "show the on-screen keyboard", "bring up on-screen keyboard",
+        )):
             return RoutedCommand("keyboard_toggle", {"open": True}, "local-pattern", 0.95)
         if any(p in normalized for p in ("close the virtual keyboard", "hide the virtual keyboard", "close virtual keyboard", "hide virtual keyboard", "close air keyboard")):
             return RoutedCommand("keyboard_toggle", {"open": False}, "local-pattern", 0.95)
@@ -736,6 +788,13 @@ class SemanticCommandRouter:
                 return RoutedCommand("volume_set", {"level": max(0, min(100, int(percent.group(1))))}, "local-pattern", 0.8)
             amount = 10
             return RoutedCommand("volume_adjust", {"delta": -amount if decrease else amount}, "local-pattern", 0.82)
+        if any(term in normalized for term in ("bluetooth status", "is bluetooth on", "is bluetooth enabled", "check bluetooth")):
+            return RoutedCommand("bluetooth_status", {}, "local-pattern", 0.92)
+        if "bluetooth" in normalized:
+            if any(x in normalized for x in ("disable", "disconnect", "turn off", "switch off")) or re.search(r"\boff\b", normalized):
+                return RoutedCommand("bluetooth_set", {"enabled": False}, "local-pattern", 0.92)
+            if any(x in normalized for x in ("enable", "connect", "turn on", "switch on")) or re.search(r"\bon\b", normalized):
+                return RoutedCommand("bluetooth_set", {"enabled": True}, "local-pattern", 0.92)
         if any(term in normalized for term in ("wifi status", "wi-fi status", "network adapters", "is wifi enabled", "is wi-fi enabled")):
             return RoutedCommand("wifi_status", {}, "local-pattern", 0.8)
         if "wifi" in normalized or "wi-fi" in normalized:
@@ -816,7 +875,7 @@ class SemanticCommandRouter:
             read_body = any(term in normalized for term in ("read my unread emails", "read unread emails", "read unread mail", "read the emails"))
             return RoutedCommand("gmail_unread", {"limit": 5 if read_body else 10, "include_body": read_body}, "local-pattern", 0.8)
         if "calendar" in normalized and any(term in normalized for term in ("next", "upcoming", "meeting", "schedule", "event")):
-            return RoutedCommand("calendar_upcoming", {"days": 7, "limit": 10}, "local-pattern", 0.8)
+            return RoutedCommand("calendar_upcoming", {"days": 30, "limit": 10}, "local-pattern", 0.8)
         return None
 
     @staticmethod
@@ -991,7 +1050,7 @@ class SemanticCommandRouter:
         if action == "calendar_search":
             return {"query": text}
         if action == "calendar_upcoming":
-            return {"days": 7, "limit": 10}
+            return {"days": 30, "limit": 10}
         if action == "general_query":
             return {"prompt": text}
         return {}

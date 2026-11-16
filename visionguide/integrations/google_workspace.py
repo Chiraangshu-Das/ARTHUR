@@ -430,13 +430,19 @@ def gmail_send_draft(
     return {"id": str(sent.get("id", "")), "thread_id": str(sent.get("threadId", "")), "status": "sent"}
 
 
-def calendar_upcoming(days: int = 7, limit: int = 10) -> list[dict[str, str]]:
+def calendar_upcoming(days: int = 30, limit: int = 20, past_days: int = 7) -> list[dict[str, str]]:
+    """List primary-calendar events across a useful past-and-future window.
+
+    The past lookback also makes recently created events visible when a parsed
+    date/time was earlier than expected, rather than silently reporting no events.
+    """
     days = max(1, min(int(days), 366))
+    past_days = max(0, min(int(past_days), 366))
     limit = max(1, min(int(limit), 50))
     now = datetime.now(timezone.utc)
     service = _service("calendar", "v3")
     result = service.events().list(
-        calendarId="primary", timeMin=now.isoformat(), timeMax=(now + timedelta(days=days)).isoformat(),
+        calendarId="primary", timeMin=(now - timedelta(days=past_days)).isoformat(), timeMax=(now + timedelta(days=days)).isoformat(),
         maxResults=limit, singleEvents=True, orderBy="startTime",
     ).execute()
     return [
@@ -504,10 +510,24 @@ def calendar_create_event(
         "end": {"dateTime": end_dt.isoformat(), "timeZone": timezone_name},
     }
     created = service.events().insert(calendarId="primary", body=event).execute()
-    return {"id": str(created.get("id", "")), "summary": summary,
-            "start": str(created.get("start", {}).get("dateTime", "")),
-            "end": str(created.get("end", {}).get("dateTime", "")),
-            "html_link": str(created.get("htmlLink", ""))}
+    event_id = str(created.get("id", ""))
+    verified = False
+    verification_error = "Google did not return an event ID for read-back verification."
+    if event_id:
+        try:
+            verified_event = service.events().get(calendarId="primary", eventId=event_id).execute()
+            verified = bool(verified_event and str(verified_event.get("id", "")) == event_id)
+            verification_error = "" if verified else "Google read-back did not return the inserted event ID."
+        except Exception as exc:
+            # The insert may already have succeeded. Preserve that fact, but never
+            # tell the user that the event is visible unless the read-back succeeds.
+            verification_error = str(exc)
+    source = verified_event if verified else created
+    return {"id": event_id, "summary": str(source.get("summary", summary)),
+            "start": str(source.get("start", {}).get("dateTime", start_dt.isoformat())),
+            "end": str(source.get("end", {}).get("dateTime", end_dt.isoformat())),
+            "html_link": str(source.get("htmlLink", created.get("htmlLink", ""))),
+            "verified": "true" if verified else "false", "verification_error": verification_error}
 
 
 def _validate_email(value: str) -> str:

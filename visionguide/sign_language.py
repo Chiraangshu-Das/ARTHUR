@@ -211,6 +211,35 @@ class ISLRecognizer:
     # MODEL LOADING
     # ---------------------------------------------------------
 
+    @staticmethod
+    def _normalize_checkpoint_state_dict(state_dict: dict) -> dict:
+        """Normalize common training-wrapper prefixes to torchvision Swin3D keys.
+
+        Some released checkpoints wrap the torchvision backbone under
+        ``base_model.`` and distributed training adds ``module.``. Remove any
+        repeated leading wrappers before translating the classifier name.
+        """
+        if not isinstance(state_dict, dict):
+            raise RuntimeError("Swin3D checkpoint state_dict must be a mapping.")
+        converted: dict = {}
+        for key, value in state_dict.items():
+            new_key = str(key)
+            while True:
+                if new_key.startswith("module."):
+                    new_key = new_key[len("module."):]
+                elif new_key.startswith("base_model."):
+                    new_key = new_key[len("base_model."):]
+                else:
+                    break
+            if new_key.startswith("classification_head.0."):
+                new_key = "head." + new_key[len("classification_head.0."):]
+            if new_key in converted:
+                raise RuntimeError(
+                    f"Checkpoint key normalization produced a duplicate parameter: {new_key!r}."
+                )
+            converted[new_key] = value
+        return converted
+
     def _load_model(self) -> torch.nn.Module:
         if not self.checkpoint_path.is_file():
             raise FileNotFoundError(
@@ -265,24 +294,7 @@ class ISLRecognizer:
                 "Unsupported Swin3D checkpoint format."
             )
 
-        converted_state_dict = {}
-
-        for key, value in state_dict.items():
-            new_key = key
-
-            if new_key.startswith("module."):
-                new_key = new_key[len("module."):]
-
-            # Training checkpoint classifier naming differs from
-            # torchvision's Swin3D classifier naming.
-            if new_key.startswith("classification_head.0."):
-                new_key = new_key.replace(
-                    "classification_head.0.",
-                    "head.",
-                    1,
-                )
-
-            converted_state_dict[new_key] = value
+        converted_state_dict = self._normalize_checkpoint_state_dict(state_dict)
 
         # Strict loading ensures that the checkpoint architecture
         # actually matches the expected Swin3D-S model.

@@ -405,6 +405,10 @@ def type_into_window(target: str, text: str, element: str = "") -> str:
     elif key in {"word", "microsoft word", "excel", "microsoft excel", "notepad", "google docs", "google sheets", "vscode", "wps docs", "wps sheets", "settings", "bluetooth settings", "wi-fi settings", "network settings", "task manager", "control panel"} and element_key in search_elements:
         pyautogui.hotkey("ctrl", "f")
         time.sleep(0.2)
+    elif key == "google drive" and element_key in search_elements:
+        # Google Drive uses '/' to focus its global Search in Drive box.
+        pyautogui.press("/")
+        time.sleep(0.2)
     elif key in {"gmail", "github"} and element_key in search_elements:
         pyautogui.press("/")  # Gmail shortcuts must be enabled; GitHub uses / to focus search.
         time.sleep(0.15)
@@ -490,6 +494,7 @@ def capture_focused_control_identity() -> tuple[int, ...] | None:
 def submit_typed_field(
     target_hwnd: int, target_title: str, target: str, element: str = "",
     expected_focus_identity: tuple[int, ...] | list[int] | None = None,
+    confirmed_submission: bool = False,
 ) -> str:
     """Press Enter in the exact window that received the last successful targeted paste.
 
@@ -510,20 +515,52 @@ def submit_typed_field(
             "Bring it back to the foreground and repeat 'press Enter'."
         )
     if not expected_focus_identity:
-        raise RuntimeError(
-            "Windows did not provide a stable identity for the field that received the text. "
-            "I will not guess which control should receive Enter; press Enter manually."
+        # A number of Chromium/Google custom controls expose no stable UIA RuntimeId.
+        # Permit a follow-up Enter only for explicit search/address fields, where Enter
+        # is non-destructive. Never apply this fallback to composers or generic forms.
+        safe_search_targets = {
+            "youtube", "browser", "chrome", "edge", "microsoft edge", "gmail", "github",
+            "google drive", "google docs", "google sheets", "google contacts", "file explorer",
+            "explorer", "whatsapp", "whatsapp web",
+        }
+        normalized_target = " ".join(str(target).casefold().split())
+        normalized_field = " ".join(str(element).casefold().split())
+        safe_field = normalized_field in {
+            "search box", "search bar", "search field", "search", "address bar", "url bar",
+        }
+        safe_target = normalized_target in safe_search_targets
+        safe_editor = (
+            (normalized_target in {"google docs", "word", "microsoft word", "notepad"}
+             and normalized_field in {"document", "editor", "text box", "text field"})
+            or (normalized_target in {"google sheets", "excel", "microsoft excel"}
+                and normalized_field in {"cell", "active cell"})
         )
-    current_focus_identity = capture_focused_control_identity()
-    if tuple(current_focus_identity or ()) != tuple(expected_focus_identity):
-        raise RuntimeError(
-            "The focused control has changed since Arthur entered the text. Nothing was submitted. "
-            "Return to the original field and repeat the typing command before asking for Enter."
+        confirmed_composer = (
+            confirmed_submission
+            and normalized_target in {"gmail", "whatsapp", "whatsapp web"}
+            and normalized_field in {"message box", "chat box", "message field", "text box", "text field", "composer"}
         )
+        if not ((safe_field and safe_target) or safe_editor or confirmed_composer):
+            raise RuntimeError(
+                "Windows did not provide a stable identity for this field. "
+                "For safety, Arthur will not press Enter in an unverified form or message composer without confirmation."
+            )
+    else:
+        current_focus_identity = capture_focused_control_identity()
+        if tuple(current_focus_identity or ()) != tuple(expected_focus_identity):
+            raise RuntimeError(
+                "The focused control has changed since Arthur entered the text. Nothing was submitted. "
+                "Return to the original field and repeat the typing command before asking for Enter."
+            )
     length = int(user32.GetWindowTextLengthW(hwnd))
     buffer = ctypes.create_unicode_buffer(max(1, length + 1))
     user32.GetWindowTextW(hwnd, buffer, len(buffer))
     active_title = buffer.value
+    if target_title and active_title.casefold() != str(target_title).casefold():
+        raise RuntimeError(
+            f"The active window title changed from {target_title!r} to {active_title!r}. "
+            "Nothing was submitted; repeat the typing command in the intended window."
+        )
     if any(marker in active_title.casefold() for marker in ("arthur", "visionguide")):
         raise RuntimeError("Arthur is the foreground window. Nothing was submitted; activate the target app and repeat.")
     import pyautogui
@@ -846,7 +883,8 @@ def focus_application_target(target: str, element: str = "") -> str:
         "file explorer": "file explorer", "explorer": "file explorer",
         "youtube": "youtube", "browser": "browser", "chrome": "chrome", "edge": "edge",
         "whatsapp": "whatsapp", "whatsapp web": "whatsapp", "gmail": "gmail",
-        "google docs": "docs", "google sheets": "sheets", "google meet": "meet",
+        "google docs": "docs", "google sheets": "sheets", "google drive": "drive",
+        "google contacts": "contacts", "google meet": "meet",
         "google classroom": "classroom", "docs": "docs", "calculator": "calculator",
         "notepad": "notepad", "word": "word", "microsoft word": "word",
         "powerpoint": "powerpoint", "microsoft powerpoint": "powerpoint",
@@ -874,6 +912,12 @@ def focus_application_target(target: str, element: str = "") -> str:
     if element in {"address bar", "url bar", "browser address bar"} and target in {"file explorer", "explorer"}:
         pyautogui.hotkey("ctrl", "l")
         return f"Focused the File Explorer address bar in {title}."
+    if element in {"search bar", "search box"} and target in {"google drive"}:
+        pyautogui.press("/")
+        return f"Sent Google Drive's search-focus shortcut to {title}. Verify that its search box has focus before typing."
+    if element in {"search bar", "search box"} and target in {"google contacts"}:
+        _focus_accessible_field(element)
+        return f"Focused the uniquely identified Google Contacts search field in {title}."
     if element in {"search bar", "search box"} and target in {"word", "microsoft word", "excel", "microsoft excel", "notepad", "google docs", "google sheets", "vscode", "wps docs", "wps sheets", "settings", "bluetooth settings", "wi-fi settings", "network settings", "task manager", "control panel"}:
         pyautogui.hotkey("ctrl", "f")
         return f"Opened the {target} Find field in {title}. Verify its focus before typing."
@@ -887,6 +931,6 @@ def focus_application_target(target: str, element: str = "") -> str:
         return f"Sent YouTube's search-focus shortcut to {title}. Verify that its search box has focus before typing."
     if element in {"message box", "chat box", "message field"} and target in {"whatsapp", "whatsapp web"}:
         raise RuntimeError("The WhatsApp window is focused, but the message field cannot be reliably verified through generic desktop automation. Click the intended chat's message box before asking Arthur to type.")
-    if element in {"search bar", "search box"} and target in {"whatsapp", "whatsapp web", "gmail", "google docs"}:
+    if element in {"search bar", "search box"} and target in {"whatsapp", "whatsapp web", "gmail"}:
         raise RuntimeError(f"The {target} window is focused, but this application's {element} cannot be verified safely. Click the intended field before typing.")
     raise ValueError(f"The target element {element!r} is not supported for {target!r}.")

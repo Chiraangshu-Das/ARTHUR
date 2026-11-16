@@ -7,6 +7,7 @@ import time
 import hashlib
 import re
 from datetime import datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
@@ -32,8 +33,8 @@ from visionguide.integrations.timers import TimerManager
 from visionguide.integrations.google_services import GoogleMapsServices
 from visionguide.navigation import NavigationSession, NavigationUpdate, WindowsLocationProvider
 from visionguide.integrations.system_controls import (
-    adjust_brightness, adjust_volume, get_brightness, get_volume, list_wifi_adapters,
-    media_playback, set_brightness, set_mute, set_volume, set_wifi,
+    adjust_brightness, adjust_volume, get_brightness, get_volume, get_radio_states, list_wifi_adapters,
+    media_playback, set_bluetooth, set_brightness, set_mute, set_volume, set_wifi,
 )
 from visionguide.integrations.google_workspace import (
     calendar_create_event, calendar_search, calendar_upcoming, gmail_read_message, gmail_search, gmail_unread,
@@ -715,9 +716,12 @@ class ArthurApp:
         return False
 
     def pause_speech(self) -> None:
+        # Signal SAPI first. Waiting for the AEC/Whisper interruption thread before
+        # requesting pause allowed short responses to finish before the button acted.
+        paused = self.speech.pause()
         self._speech_interrupt_stop.set()
         self._stop_speech_interrupt_listener()
-        if self.speech.pause():
+        if paused:
             self.status_var.set("Speech paused · listening for continue")
             self._append_output("Speech paused. Say 'continue' or press Resume speech.")
             if self.conversation_active:
@@ -737,7 +741,10 @@ class ArthurApp:
             self._append_output("There is no paused response to resume.")
 
     def cancel_speech(self) -> None:
+        # Purge queued/current SAPI audio before waiting for the microphone listener.
         self.speech.cancel()
+        self._speech_interrupt_stop.set()
+        self._stop_speech_interrupt_listener()
         self.status_var.set("Speech cancelled")
         self._append_output("The current spoken response was cancelled.")
 
@@ -969,13 +976,62 @@ class ArthurApp:
             messagebox.showerror("Camera could not start", str(exc))
 
     def describe_scene(self):
+        """Describe one fresh camera frame, optionally combining Groq vision and local detections."""
         try:
-            _frame, detections = self._camera_snapshot_for_task(wait_for_detection=True)
-            text = summarize_scene(detections) if detections else "I could not confidently detect any objects in the current view."
+            frame, detections = self._camera_snapshot_for_task(wait_for_detection=True)
+            if self.depth_worker is not None:
+                detections = self.depth_worker.decorate(detections)
+                _readings, depth_status, depth_error = self.depth_worker.snapshot()
+            else:
+                depth_status, depth_error = "Metric depth is not enabled.", ""
+            local_summary = summarize_scene(detections)
+            object_notes = []
+            for item in detections[:20]:
+                note = f"{item.label} ({item.confidence:.0%}) at image-relative {item.direction}"
+                if item.distance_m is not None:
+                    note += f", estimated range {item.distance_m:.1f} m"
+                if item.motion_direction:
+                    note += f", {item.motion_direction}"
+                object_notes.append(note)
         except Exception as exc:
-            text = f"I could not describe the scene: {exc}"
-        self._set_output(text)
-        self._say(text)
+            message = f"I could not capture a current camera frame for scene description: {exc}"
+            self._set_output(message)
+            self._say(message)
+            return
+
+        if self.gemini.available():
+            consent = self._ask_yes_no(
+                "Send camera frame to Groq?",
+                "Arthur will upload one current camera frame to the configured Groq vision model to describe the scene. "
+                "Local object detections and available depth estimates will also be provided as context. "
+                "The image may contain people or private information. Continue?",
+            )
+            if consent:
+                prompt = (
+                    "Describe this freshly captured camera image for an assistive user. Start with the overall scene, "
+                    "then identify prominent objects and their image-relative positions. Answer from visible evidence; "
+                    "do not guess brands, text, identities, or hidden objects. State uncertainty explicitly. "
+                    "Do not present monocular depth as verified physical distance.\n\n"
+                    f"Arthur local object detector observations: {('; '.join(object_notes) if object_notes else 'No objects passed the local detector threshold.')}\n"
+                    f"Local depth subsystem status: {depth_status}. {depth_error}\n"
+                    f"Local detection summary: {local_summary}"
+                )
+                self.status_var.set("Analyzing the current camera frame with Groq vision…")
+                self._set_output("The current camera frame was captured. Sending it for visual analysis…")
+                self._run_async("gemini", lambda: self.gemini.ask_about_frame(prompt, frame, False))
+                return
+
+        message = local_summary
+        if depth_status:
+            message += f"\n\nDepth subsystem: {depth_status}"
+        if depth_error:
+            message += f" Diagnostic: {depth_error}"
+        if self.gemini.available():
+            message += "\n\nThe camera image was not uploaded; this is the local detection/depth summary only."
+        else:
+            message += "\n\nGroq vision is not configured; this is the local detection/depth summary only."
+        self._set_output(message)
+        self._say(message)
 
     def scan_document(self):
         frame = self._require_frame()
@@ -1045,6 +1101,43 @@ class ArthurApp:
             self._unknown_greeted = False
             self._append_output("Local face recognition is disabled.")
             self._maybe_stop_camera()
+
+    def identify_current_face(self) -> None:
+        """Perform a one-shot match against locally enrolled faces."""
+        if not self.face_memory.available:
+            message = "Face recognition is unavailable. Install opencv-contrib-python and restart Arthur."
+            self._set_output(message)
+            self._say(message)
+            return
+        enrolled = self.face_memory.list_people()
+        if not enrolled:
+            message = "No faces are enrolled yet. Enroll a consenting person first."
+            self._set_output(message)
+            self._say(message)
+            return
+        try:
+            frame, _detections = self._camera_snapshot_for_task(wait_for_detection=False)
+        except Exception as exc:
+            message = f"I could not capture a camera frame for face recognition: {exc}"
+            self._set_output(message)
+            self._say(message)
+            return
+        self.status_var.set("Checking the current face against local enrollments…")
+        self._run_async("face_identify", lambda: self._identify_face_in_frame(frame))
+
+    def _identify_face_in_frame(self, frame):
+        faces = self.face_memory.detect_faces(frame)
+        if not faces:
+            return {"profile": None, "message": "I could not detect a face clearly in the current camera frame."}
+        if len(faces) != 1:
+            return {"profile": None, "message": f"I detected {len(faces)} faces. I will not guess which person you are asking about; place one face in view and try again."}
+        match = self.face_memory.recognize(faces[0][4])
+        if not match:
+            return {"profile": None, "message": "I detected a face, but it does not confidently match any enrolled person."}
+        name, confidence = match
+        if str(name).casefold() == "unknown face" or not self.face_memory.is_enrolled_name(str(name)):
+            return {"profile": None, "message": "I detected a face, but I cannot confidently identify it as an enrolled person."}
+        return {"profile": str(name), "message": f"Yes. This face matches the locally enrolled profile for {name}. Recognition confidence score: {float(confidence):.1f}."}
 
     def _ask_voice_text(self, prompt: str, duration_seconds: float = 10.0) -> str:
         """Ask for a short spoken value after playback has completed."""
@@ -1541,6 +1634,15 @@ class ArthurApp:
                 elif action == "conversation_result":
                     turn_id, response, success = result
                     self.conversation_context.set_result(int(turn_id), response, success=bool(success))
+                elif action == "face_identify":
+                    payload = result if isinstance(result, dict) else {"profile": None, "message": str(result)}
+                    profile = payload.get("profile")
+                    self._activate_face_profile(str(profile) if profile else None)
+                    message = str(payload.get("message", "No enrolled face match was confirmed."))
+                    self._set_output(message)
+                    self._say(message)
+                    self._record_async_action(action, message, success=bool(profile))
+                    self.status_var.set("Face recognized" if profile else "No confident face match")
                 elif action == "face_scan":
                     self._face_scan_pending = False
                     matches = list(result or [])
@@ -1592,8 +1694,6 @@ class ArthurApp:
                 elif action in {"typed_text", "type_into_window"}:
                     if isinstance(result, dict):
                         message = str(result.get("message", "Typing completed."))
-                        if not result.get("focus_identity"):
-                            message += " Windows could not expose a stable focused-control identity, so Arthur cannot safely automate a follow-up Enter here; press Enter manually."
                         self._pending_field_context = {
                             "target_hwnd": int(result.get("target_hwnd", 0) or 0),
                             "target_title": str(result.get("target_title", "")),
@@ -1752,7 +1852,9 @@ class ArthurApp:
             f"{traffic_delta}{beta_note}{maps_note}\n\nThis is a route-provider estimate, not confirmation of road conditions beyond its returned data."
         )
 
-    def _research_visible_item(self, frame, query: str) -> str:
+    def _research_visible_item(
+        self, frame, query: str, detections=None, depth_status: str = "", depth_error: str = "",
+    ) -> str:
         # Cache by image content + question; raw camera frames are not written to disk.
         ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 78])
         if not ok:
@@ -1763,6 +1865,18 @@ class ArthurApp:
             return str(cached.get("response", "")) + "\n\nThis answer was reused from the local cache; it may be stale."
 
         sections: list[str] = []
+        detection_notes = []
+        for item in list(detections or [])[:20]:
+            note = f"{item.label} ({item.confidence:.0%}) at image-relative {item.direction}"
+            if item.distance_m is not None:
+                note += f", estimated range {item.distance_m:.1f} m"
+            if item.motion_direction:
+                note += f", {item.motion_direction}"
+            detection_notes.append(note)
+        if detection_notes:
+            sections.append("Local YOLO object detections and tracking context (not an exact product identity):\n" + "; ".join(detection_notes))
+        if depth_status:
+            sections.append(f"Local depth subsystem: {depth_status}. {depth_error}")
         try:
             ocr_text = str(read_document(frame)).strip()
             if ocr_text:
@@ -1782,9 +1896,14 @@ class ArthurApp:
 
         if self.gemini.available():
             prompt = (
-                f"{query}\n\nUse only visible evidence for visual claims. Use the attached image to infer likely object category and, if legible, brand/model. "
-                "When product facts are uncertain, distinguish inference from verified information. If the image contains a person, do not claim a verified identity from appearance or image similarity; public visual-search matches are only leads and must be described as such. "
-                "When web search is available, cite or name the source/website used. Keep the answer concise and useful."
+                f"{query}\n\nUse the attached fresh camera image as the primary evidence. Use only visible evidence for visual claims. "
+                "Use OCR and local detector observations as supporting context, not as proof of an exact product identity. "
+                "If the user asks a specific question about the scene or item, answer that question directly first. "
+                "When product facts are uncertain, distinguish inference from verified information. Do not invent brands, model numbers, specifications, or prices. "
+                "If the image contains a person, do not claim a verified identity from appearance or image similarity; public visual-search matches are only leads and must be described as such. "
+                "Do not treat monocular depth estimates as verified physical distances. When web search is available, cite or name the source/website used. Keep the answer concise and useful.\n\n"
+                f"Local detector observations: {'; '.join(detection_notes) if detection_notes else 'No local YOLO objects passed the detection threshold.'}\n"
+                f"Depth subsystem: {depth_status or 'not reported'}. {depth_error}"
             )
             try:
                 sections.append("Groq visual research:\n" + self.gemini.ask_about_frame(prompt, frame, True))
@@ -1925,6 +2044,9 @@ class ArthurApp:
                 message = "Face recognition is already enabled." if desired else "Face recognition is already disabled."
                 self._set_output(message); self._say(message)
             return
+        if action == "face_identify":
+            self.identify_current_face()
+            return
         if action == "submit_typed_field":
             context = self._pending_field_context
             if not context:
@@ -1942,6 +2064,7 @@ class ArthurApp:
             normalized_target = target.casefold()
             normalized_element = element.casefold()
             requires_confirmation = field_submission_requires_confirmation(target, element)
+            confirmed_submission = not requires_confirmation
             if requires_confirmation:
                 warning = (
                     "Enter may send a message or submit a form. Verify the visible recipient/destination and the entire text before proceeding."
@@ -1955,13 +2078,14 @@ class ArthurApp:
                 if not approved:
                     self._say("Enter was not pressed. The text remains in the field.")
                     return
+                confirmed_submission = True
             self._pending_field_context = None
             self.status_var.set("Submitting the remembered field…")
             self._run_async(
                 "field_submit",
                 lambda: submit_typed_field(
                     int(context.get("target_hwnd", 0)), title, target, element,
-                    context.get("focus_identity"),
+                    context.get("focus_identity"), confirmed_submission=confirmed_submission,
                 ),
             )
             return
@@ -2015,6 +2139,27 @@ class ArthurApp:
             except Exception as exc:
                 self._set_output(f"Could not focus the requested target safely: {exc}")
                 self._say("I could not verify that control. Please select the field manually before typing.")
+            return
+        if action == "current_datetime":
+            detail = str(args.get("detail", "datetime")).strip().casefold()
+            timezone_name = os.getenv("VISIONGUIDE_TIMEZONE", "Asia/Kolkata").strip() or "Asia/Kolkata"
+            try:
+                now = datetime.now(ZoneInfo(timezone_name))
+            except (ZoneInfoNotFoundError, ValueError):
+                now = datetime.now().astimezone()
+                timezone_name = now.tzinfo.key if hasattr(now.tzinfo, "key") else (now.tzname() or "local timezone")
+
+            if detail == "time":
+                response = f"The current local time is {now.strftime('%I:%M %p').lstrip('0')}."
+            elif detail == "date":
+                response = f"Today's date is {now.strftime('%A, %d %B %Y')}."
+            elif detail == "day":
+                response = f"Today is {now.strftime('%A')}."
+            elif detail == "timezone":
+                response = f"Your configured local timezone is {timezone_name} (UTC{now.strftime('%z')})."
+            else:
+                response = f"It is {now.strftime('%A, %d %B %Y')}, and the local time is {now.strftime('%I:%M %p').lstrip('0')}."
+            self._set_output(response); self._say(response)
             return
         if action == "calculate_expression":
             try:
@@ -2145,14 +2290,26 @@ class ArthurApp:
                 self._set_output(message); self._say(message)
             return
         if action == "product_lookup":
-            frame = self._require_frame()
-            if frame is None:
+            try:
+                frame, detections = self._camera_snapshot_for_task(wait_for_detection=True)
+                if self.depth_worker is not None:
+                    detections = self.depth_worker.decorate(detections)
+                    _depth_readings, depth_status, depth_error = self.depth_worker.snapshot()
+                else:
+                    depth_status, depth_error = "Metric depth is not enabled.", ""
+            except Exception as exc:
+                message = f"I could not capture a current camera frame for product research: {exc}"
+                self._set_output(message)
+                self._say(message)
                 return
             query = str(args.get("query", "Tell me about the visible product or object.")).strip()
-            if not self._ask_yes_no("Research the visible item?", "Arthur will send a compressed camera image to the configured Groq service and, when a Google Cloud API key is available, Google Cloud Vision Web Detection to look for related public pages and visually similar images. The image may contain people or private information. Continue?"):
+            if not self._ask_yes_no("Research the visible item?", "Arthur will send one fresh camera image to the configured Groq vision service and, when configured, Google Cloud Vision Web Detection. Local YOLO detections and available depth estimates will also be included. The image may contain people or private information. Continue?"):
                 self._say("Visual product research cancelled; the image was not uploaded by this action.")
                 return
-            self._run_async("product_lookup", lambda: self._research_visible_item(frame, query))
+            self._run_async(
+                "product_lookup",
+                lambda: self._research_visible_item(frame, query, detections, depth_status, depth_error),
+            )
             return
 
         # Google API extensions execute only through scoped adapters and bounded requests.
@@ -2191,7 +2348,7 @@ class ArthurApp:
             return
 
         # These integrations execute through typed, permission-aware device/provider adapters.
-        if action in {"media_playback", "brightness_set", "brightness_adjust", "volume_set", "volume_adjust", "audio_mute", "wifi_set", "wifi_status", "brightness_get", "volume_get",
+        if action in {"media_playback", "brightness_set", "brightness_adjust", "volume_set", "volume_adjust", "audio_mute", "wifi_set", "wifi_status", "bluetooth_set", "bluetooth_status", "brightness_get", "volume_get",
                       "timer_set", "timer_list", "timer_cancel", "reminder_schedule", "reminder_list", "reminder_cancel",
                       "gmail_unread", "gmail_search", "calendar_upcoming", "calendar_search",
                       "calendar_create_event", "gmail_compose", "gmail_send_current", "gmail_read_message", "word_write",
@@ -2224,18 +2381,29 @@ class ArthurApp:
                     response = f"System volume is {state['volume']} percent and audio is {'muted' if state['muted'] else 'unmuted'}."
                     self._set_output(response); self._say(response)
                 elif action == "wifi_status":
-                    adapters = list_wifi_adapters()
-                    response = "Network adapters: " + ("; ".join(f"{x['name']}: {x['admin_state']}, {x['state']}" for x in adapters) or "none detected")
-                    self._set_output(response); self._say(response[:1500])
+                    states = get_radio_states()
+                    response = "Wi-Fi radio state: " + states.get("wifi", "unavailable")
+                    self._set_output(response); self._say(response)
                 elif action == "wifi_set":
                     enabled = bool(args.get("enabled"))
-                    adapter = str(args.get("adapter", "Wi-Fi"))
-                    operation = "enable" if enabled else "disable"
-                    if self._ask_yes_no("Change Wi-Fi state?", f"This will {operation} the network adapter {adapter!r}. This may disconnect Arthur and active work. Continue?"):
-                        response = set_wifi(enabled, adapter)
+                    operation = "turn on" if enabled else "turn off"
+                    if self._ask_yes_no("Change Wi-Fi state?", f"This will {operation} the Windows Wi-Fi radio and may disconnect Arthur and active work. Continue?"):
+                        response = set_wifi(enabled)
                         self._set_output(response); self._say(response)
                     else:
                         self._say("Wi-Fi change cancelled.")
+                elif action == "bluetooth_status":
+                    states = get_radio_states()
+                    response = "Bluetooth radio state: " + states.get("bluetooth", "unavailable")
+                    self._set_output(response); self._say(response)
+                elif action == "bluetooth_set":
+                    enabled = bool(args.get("enabled"))
+                    operation = "turn on" if enabled else "turn off"
+                    if self._ask_yes_no("Change Bluetooth state?", f"This will {operation} the Windows Bluetooth radio. Existing Bluetooth connections may disconnect. Continue?"):
+                        response = set_bluetooth(enabled)
+                        self._set_output(response); self._say(response)
+                    else:
+                        self._say("Bluetooth change cancelled.")
                 elif action == "timer_set":
                     record = self.timer_manager.schedule(int(args.get("seconds", 0)), str(args.get("label", "Reminder")))
                     response = f"Timer {record.timer_id} set for {record.duration_seconds} seconds: {record.label}."
@@ -2289,7 +2457,7 @@ class ArthurApp:
                     limit = int(args.get("limit", 10))
                     self._run_async("workspace", lambda: {"kind": "gmail_search", "messages": gmail_search(query, limit)})
                 elif action == "calendar_upcoming":
-                    days, limit = int(args.get("days", 7)), int(args.get("limit", 10))
+                    days, limit = int(args.get("days", 30)), int(args.get("limit", 10))
                     self._run_async("workspace", lambda: {"kind": "calendar_upcoming", "events": calendar_upcoming(days, limit)})
                 elif action == "calendar_search":
                     query = str(args.get("query", "")); days = int(args.get("days", 180))
@@ -2639,7 +2807,11 @@ class ArthurApp:
                 for i, event in enumerate(events[:30], 1))
         if kind == "calendar_create_event":
             event = result.get("event", {})
-            return f"Calendar event created: {event.get('summary', '')}, {event.get('start', '')} to {event.get('end', '')}. {event.get('html_link', '')}"
+            base = f"Calendar event inserted: {event.get('summary', '')}, {event.get('start', '')} to {event.get('end', '')}. {event.get('html_link', '')}"
+            if str(event.get("verified", "false")).casefold() == "true":
+                return base + " Google Calendar read-back verification succeeded."
+            detail = str(event.get("verification_error", "Read-back verification was not available.")).strip()
+            return base + " WARNING: Google did not verify that the event can be read back. Do not assume it is visible in your calendar." + (f" Diagnostic: {detail}" if detail else "")
         if kind == "places_search":
             places = result.get("places", []) or []
             if not places:

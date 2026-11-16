@@ -2,3 +2,4 @@
 # Enable Windows Location services and grant access in Windows Settings as well.
 winrt-runtime>=3.1.0,<4.0.0; platform_system == "Windows"
 winrt-Windows.Devices.Geolocation>=3.1.0,<4.0.0; platform_system == "Windows"
+winrt-Windows.Devices.Radios>=3.1.0,<4.0.0; platform_system == "Windows"

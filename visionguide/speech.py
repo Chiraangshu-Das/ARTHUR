@@ -24,6 +24,7 @@ class SpeechOutput:
 
     SAPI_ASYNC = 1
     SAPI_PURGE = 2
+    SAPI_PURGE_ASYNC = SAPI_ASYNC | SAPI_PURGE
 
     def __init__(self, rate: int = 165, enabled: bool = True):
         self.enabled = bool(enabled)
@@ -72,6 +73,14 @@ class SpeechOutput:
     def _sapi_rate(rate: int) -> int:
         """Map the previous pyttsx3-style rate to SAPI's -10..10 range."""
         return max(-10, min(10, round((int(rate) - 175) / 20)))
+
+    @staticmethod
+    def _sapi_is_done(status) -> bool:
+        """SAPI SRSEDone is 1; 0 means waiting, not completion."""
+        try:
+            return int(status.RunningState) == 1
+        except Exception:
+            return False
 
     @staticmethod
     def _remaining_after_current_word(segment: str, status) -> str:
@@ -162,7 +171,7 @@ class SpeechOutput:
                         control = self._take_control()
                         if control == "cancel":
                             try:
-                                self._voice.Speak("", self.SAPI_PURGE)
+                                self._voice.Speak("", self.SAPI_PURGE_ASYNC)
                             except Exception:
                                 pass
                             with self._state_lock:
@@ -192,7 +201,7 @@ class SpeechOutput:
                                 if control == "pause" and status is not None:
                                     remainder = self._remaining_after_current_word(segment, status)
                                 try:
-                                    self._voice.Speak("", self.SAPI_PURGE)
+                                    self._voice.Speak("", self.SAPI_PURGE_ASYNC)
                                 except Exception as exc:
                                     self._last_error = str(exc)
                                 with self._state_lock:
@@ -206,14 +215,22 @@ class SpeechOutput:
                                 interrupted = True
                                 break
                             try:
-                                status = self._voice.GetStatus()
-                                running = int(status.RunningState)
+                                # RunningState == 0 means SAPI is waiting to start an
+                                # asynchronous utterance. It does NOT mean playback
+                                # completed. WaitUntilDone handles the queued state and
+                                # is polled with a short timeout so pause/cancel stays
+                                # responsive.
+                                wait_until_done = getattr(self._voice, "WaitUntilDone", None)
+                                if callable(wait_until_done):
+                                    completed = bool(wait_until_done(40))
+                                else:
+                                    completed = self._sapi_is_done(self._voice.GetStatus())
                             except Exception as exc:
                                 self._last_error = str(exc)
-                                running = 0
-                            if running == 0:
+                                completed = False
+                            if completed:
                                 break
-                            time.sleep(0.04)
+                            time.sleep(0.01)
                         if interrupted:
                             break
                         index += 1

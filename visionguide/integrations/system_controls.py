@@ -161,6 +161,130 @@ def set_mute(muted: bool) -> str:
     return "System audio muted." if muted else "System audio unmuted."
 
 
+def _run_winrt_radio_coroutine(coroutine):
+    """Run a WinRT coroutine safely from either a plain thread or an active asyncio loop."""
+    import asyncio
+    import threading
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coroutine)
+
+    result: dict[str, object] = {}
+    finished = threading.Event()
+
+    def runner():
+        try:
+            result["value"] = asyncio.run(coroutine)
+        except BaseException as exc:
+            result["error"] = exc
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=runner, name="arthur-winrt-radio", daemon=True)
+    thread.start()
+    if not finished.wait(15.0):
+        raise TimeoutError("Windows radio operation timed out after 15 seconds.")
+    if "error" in result:
+        raise result["error"]  # type: ignore[misc]
+    return result.get("value")
+
+
+def _radio_name(radio) -> str:
+    kind = getattr(radio, "kind", None)
+    name = str(getattr(kind, "name", kind)).casefold().replace("_", "")
+    if "bluetooth" in name:
+        return "bluetooth"
+    if "wifi" in name or "wi-fi" in name:
+        return "wifi"
+    return ""
+
+
+def _radio_state_name(radio) -> str:
+    state = getattr(radio, "state", None)
+    return str(getattr(state, "name", state)).split(".")[-1].replace("_", " ").title()
+
+
+async def _get_winrt_radios():
+    try:
+        from winrt.windows.devices.radios import Radio
+    except ImportError as exc:
+        raise RuntimeError(
+            "Windows Wi-Fi/Bluetooth radio control requires WinRT Radio support. "
+            "Run `python -m pip install -r requirements-navigation.txt` and restart Arthur."
+        ) from exc
+    return await Radio.get_radios_async()
+
+
+def get_radio_states() -> dict[str, str]:
+    """Read the Windows Wi-Fi and Bluetooth radio states, without changing them."""
+    _require_windows("Wi-Fi/Bluetooth radio status")
+
+    async def read_states():
+        radios = await _get_winrt_radios()
+        states: dict[str, str] = {}
+        for radio in radios:
+            key = _radio_name(radio)
+            if key:
+                states[key] = _radio_state_name(radio)
+        return states
+
+    states = _run_winrt_radio_coroutine(read_states())
+    return {"wifi": states.get("wifi", "not detected"), "bluetooth": states.get("bluetooth", "not detected")}
+
+
+def _set_windows_radio(kind: str, enabled: bool) -> str:
+    _require_windows(f"{kind.title()} radio control")
+
+    async def change_state():
+        from winrt.windows.devices.radios import Radio, RadioAccessStatus, RadioState
+
+        radios = await _get_winrt_radios()
+        matches = [radio for radio in radios if _radio_name(radio) == kind]
+        if not matches:
+            raise RuntimeError(f"Windows did not report a {kind.title()} radio. Check the device driver and hardware switch.")
+
+        access = await Radio.request_access_async()
+        if access != RadioAccessStatus.ALLOWED:
+            raise PermissionError(
+                f"Windows denied permission to change the {kind.title()} radio (access status: {access}). "
+                "Check Windows privacy/device policy and try again."
+            )
+
+        desired = RadioState.ON if enabled else RadioState.OFF
+        target = matches[0]
+        result = await target.set_state_async(desired)
+        if result != RadioAccessStatus.ALLOWED:
+            raise PermissionError(
+                f"Windows did not allow the {kind.title()} radio change (status: {result}). "
+                "A hardware switch, airplane mode, device policy, or driver may be overriding it."
+            )
+
+        # Re-enumerate after the operation. Do not report success based only on a
+        # command being accepted: the actual radio state must match the request.
+        import asyncio
+        expected = "On" if enabled else "Off"
+        for _ in range(5):
+            await asyncio.sleep(0.25)
+            refreshed = await _get_winrt_radios()
+            current = next((radio for radio in refreshed if _radio_name(radio) == kind), None)
+            if current is not None and _radio_state_name(current) == expected:
+                return expected
+        actual = _radio_state_name(current) if current is not None else "not detected"
+        raise RuntimeError(
+            f"Windows accepted the {kind.title()} radio request but its reported state is {actual!r}, not {expected!r}. "
+            "Check airplane mode, hardware controls, and the device driver."
+        )
+
+    state = _run_winrt_radio_coroutine(change_state())
+    return f"Windows {kind.title()} radio is now verified {str(state).lower()}."
+
+
+def set_bluetooth(enabled: bool) -> str:
+    return _set_windows_radio("bluetooth", bool(enabled))
+
+
 def list_wifi_adapters() -> list[dict[str, str]]:
     _require_windows("Wi-Fi adapter management")
     result = subprocess.run(
@@ -179,27 +303,13 @@ def list_wifi_adapters() -> list[dict[str, str]]:
 
 
 def set_wifi(enabled: bool, adapter: str | None = None) -> str:
-    """Enable/disable one specifically named Wi-Fi adapter; requires elevated privileges on Windows."""
-    _require_windows("Wi-Fi adapter management")
-    wanted = (adapter or os.getenv("VISIONGUIDE_WIFI_ADAPTER", "Wi-Fi")).strip()
-    if not wanted or len(wanted) > 80:
-        raise ValueError("A valid Wi-Fi adapter name is required.")
-    if '"' in wanted or "\n" in wanted or "\r" in wanted:
-        raise ValueError("Invalid Wi-Fi adapter name.")
-    # Confirm that the requested name exists before issuing the state-changing command.
-    adapters = list_wifi_adapters()
-    if not any(a["name"].casefold() == wanted.casefold() for a in adapters):
-        names = ", ".join(a["name"] for a in adapters) or "none detected"
-        raise ValueError(f"Adapter {wanted!r} was not found. Detected interfaces: {names}.")
-    admin_state = "enabled" if enabled else "disabled"
-    result = subprocess.run(
-        ["netsh", "interface", "set", "interface", f"name={wanted}", f"admin={admin_state}"],
-        capture_output=True, text=True, timeout=10, check=False, shell=False,
-    )
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()
-        raise RuntimeError(f"Could not {admin_state} {wanted!r}. Administrator permission may be required. {detail}")
-    return f"Requested that Wi-Fi adapter {wanted!r} be {admin_state}. Verify connectivity after the change."
+    """Turn the Windows Wi-Fi radio on/off (not the underlying NIC admin state).
+
+    ``adapter`` is retained for backwards compatibility with older callers but is
+    no longer used: Windows Radio controls the platform radio rather than disabling
+    an arbitrary network interface.
+    """
+    return _set_windows_radio("wifi", bool(enabled))
 
 
 def adjust_brightness(delta: int) -> str:

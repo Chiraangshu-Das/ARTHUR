@@ -28,8 +28,8 @@ from visionguide.integrations.google_services import GoogleMapsServices, execute
 from visionguide.integrations.google_cloud_services import execute_google_cloud_operation
 from visionguide.integrations.gui_automation import compose_gmail_gui
 from visionguide.integrations.system_controls import (
-    adjust_brightness, adjust_volume, get_brightness, get_volume, list_wifi_adapters,
-    media_playback, set_brightness, set_mute, set_volume, set_wifi,
+    adjust_brightness, adjust_volume, get_brightness, get_radio_states, get_volume, list_wifi_adapters,
+    media_playback, set_bluetooth, set_brightness, set_mute, set_volume, set_wifi,
 )
 from visionguide.integrations.timers import TimerManager
 from visionguide.semantic_router import RoutedCommand, SemanticCommandRouter
@@ -42,7 +42,7 @@ _loop: asyncio.AbstractEventLoop | None = None
 _websocket_clients: set[WebSocket] = set()
 _pending_confirmations: dict[str, tuple[float, str, RoutedCommand]] = {}
 _confirmation_lock = threading.Lock()
-_CONFIRMATION_ACTIONS = {"wifi_set", "calendar_create_event", "gmail_compose", "gmail_send_current",
+_CONFIRMATION_ACTIONS = {"wifi_set", "bluetooth_set", "calendar_create_event", "gmail_compose", "gmail_send_current",
                          "word_write", "whatsapp_compose", "whatsapp_send_current", "type_into_window", "close_website"}
 _maps_services = GoogleMapsServices()
 
@@ -203,6 +203,8 @@ def tools(_: bool = Depends(_authorized_header)) -> dict[str, Any]:
         {"name": "audio_mute", "device_local": True},
         {"name": "wifi_status", "device_local": True},
         {"name": "wifi_set", "requires_confirmation": True, "device_local": True},
+        {"name": "bluetooth_status", "device_local": True},
+        {"name": "bluetooth_set", "requires_confirmation": True, "device_local": True},
         {"name": "timer_set", "background": True},
         {"name": "timer_list", "background": True},
         {"name": "timer_cancel", "background": True},
@@ -483,15 +485,19 @@ def execute_route(route: RoutedCommand, *, confirmed: bool = False) -> dict[str,
         if action == "volume_get":
             return {"status": "ok", **get_volume()}
         if action == "wifi_status":
-            return {"status": "ok", "adapters": list_wifi_adapters()}
+            return {"status": "ok", "radios": get_radio_states()}
+        if action == "bluetooth_status":
+            return {"status": "ok", "radios": get_radio_states()}
+        if action == "bluetooth_set":
+            if not confirmed:
+                return {"status": "confirmation_required", "message": "Confirm changing the Bluetooth radio state; active connections may disconnect.", "preview": args}
+            return {"status": "ok", "message": set_bluetooth(bool(args.get("enabled")))}
         if action == "audio_mute":
             return {"status": "ok", "message": set_mute(bool(args.get("muted", True)))}
         if action == "wifi_set":
             if not confirmed:
                 return {"status": "confirmation_required", "message": "Confirm changing the network adapter state; this can disconnect the client.", "preview": args}
             return {"status": "ok", "message": set_wifi(bool(args.get("enabled")), str(args.get("adapter", "Wi-Fi")))}
-        if action == "wifi_status":
-            return {"status": "ok", "adapters": list_wifi_adapters()}
         if action == "brightness_get":
             return {"status": "ok", "brightness": get_brightness()}
         if action == "volume_get":
@@ -529,7 +535,7 @@ def execute_route(route: RoutedCommand, *, confirmed: bool = False) -> dict[str,
             messages = gmail_search(str(args.get("query", "")), int(args.get("limit", 10)))
             return {"status": "ok", "messages": messages, "count": len(messages)}
         if action == "calendar_upcoming":
-            events = calendar_upcoming(int(args.get("days", 7)), int(args.get("limit", 10)))
+            events = calendar_upcoming(int(args.get("days", 30)), int(args.get("limit", 20)))
             return {"status": "ok", "events": events, "count": len(events)}
         if action == "calendar_search":
             events = calendar_search(str(args.get("query", "")), int(args.get("days", 180)))
