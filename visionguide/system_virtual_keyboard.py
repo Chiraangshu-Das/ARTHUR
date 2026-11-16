@@ -316,13 +316,12 @@ class SystemVirtualKeyboard:
                 # Caps Lock changes are reflected even while this overlay is open.
                 self._caps_lock = self._read_windows_caps_lock()
                 self._set_button_state("caps", self._caps_lock)
-                want_shift = self._caps_lock ^ ("shift" in self._modifiers)
-                self._send_key(
-                    pyautogui,
-                    key.lower(),
-                    force_shift=want_shift,
-                    ignore_shift_modifier=True,
-                )
+                # Windows already applies the real Caps Lock state when it
+                # receives an alphabetic key. Only pass an explicit Shift
+                # modifier when the user armed Shift on this virtual keyboard.
+                # Applying Shift based on Caps Lock here would invert the
+                # requested case (Caps Lock + Shift produces lowercase).
+                self._send_key(pyautogui, key.lower())
             elif len(key) == 1 and key in self.SHIFTED_KEYS:
                 # A manually armed Shift or Caps Lock does not alter punctuation;
                 # punctuation uses Shift only when the Shift modifier is armed.
